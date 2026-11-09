@@ -1,11 +1,12 @@
 import type { HostReadyContext } from "@openchamber/sdk";
 
 import { createCircleCIClient } from "../shared/client";
-import { attachChip, startSessionFrom, type ChipSource } from "../shared/chips";
+import { attachChip, startSessionFrom, type ChipSource } from "../shared/actions";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { duration, isFailure, refLabel, relativeTime, shortSha, statusOf } from "../shared/format";
-import { host, request } from "../shared/host";
+import { host, notify, readProjectFile, request } from "../shared/host";
+import { anyRunning, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import { loadPreferences, savePreferences, type StorageLike } from "../shared/storage";
 import type { Job, Preferences, Run, Workflow } from "../shared/types";
@@ -43,8 +44,6 @@ const client = createCircleCIClient(request);
 const storage: StorageLike = host.storage;
 
 const POLL_MS = 30_000;
-
-type RunFilter = "all" | "failed" | "running";
 
 /**
  * The runs list and its filter tabs, mounted once per render of the left
@@ -99,14 +98,6 @@ const state: PageState = {
 let renderToken = 0;
 let pollTimer: number | null = null;
 
-async function toast(kind: "info" | "success" | "error", message: string): Promise<void> {
-  try {
-    await host.toast({ kind, message });
-  } catch {
-    // The page keeps its own error banner.
-  }
-}
-
 /* ------------------------------------------------------------------- data */
 
 async function boot(): Promise<void> {
@@ -124,7 +115,7 @@ async function boot(): Promise<void> {
     return;
   }
   try {
-    state.workspace = await resolveWorkspace(client, storage, state.directory);
+    state.workspace = await resolveWorkspace(client, storage, state.directory, readProjectFile);
     if (!state.workspace) {
       state.loading = false;
       render();
@@ -234,9 +225,9 @@ async function attach(source: ChipSource | null): Promise<void> {
   if (!source) return;
   try {
     await attachChip(source);
-    await toast("success", "Attached to the chat box.");
+    await notify("success", "Attached to the chat box.");
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
@@ -244,29 +235,29 @@ async function startSession(source: ChipSource | null): Promise<void> {
   if (!source) return;
   try {
     await startSessionFrom(source);
-    await toast("success", "Started a worktree chat for this build.");
+    await notify("success", "Started a worktree chat for this build.");
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
 async function rerun(workflow: Workflow, fromFailed: boolean): Promise<void> {
   try {
     await client.rerunWorkflow(workflow.id, fromFailed);
-    await toast("success", `Rerun started for ${workflow.name}.`);
+    await notify("success", `Rerun started for ${workflow.name}.`);
     await refreshDetail();
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
 async function cancel(workflow: Workflow): Promise<void> {
   try {
     await client.cancelWorkflow(workflow.id);
-    await toast("success", `Cancellation requested for ${workflow.name}.`);
+    await notify("success", `Cancellation requested for ${workflow.name}.`);
     await refreshDetail();
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
@@ -274,20 +265,18 @@ async function decideApproval(job: Job, approve: boolean): Promise<void> {
   try {
     if (approve) await client.approve(job.id);
     else await client.reject(job.id);
-    await toast("success", approve ? `Approved ${job.name}.` : `Rejected ${job.name}.`);
+    await notify("success", approve ? `Approved ${job.name}.` : `Rejected ${job.name}.`);
     await refreshDetail();
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
 /* ----------------------------------------------------------------- polling */
 
 function viewIsActive(): boolean {
-  if (state.selectedRun) {
-    return state.workflows.some((workflow) => statusOf(workflow.phase, workflow.outcome).active);
-  }
-  return state.runs.some((run) => statusOf(run.phase, run.outcome).active);
+  if (state.selectedRun) return anyRunning(state.workflows);
+  return anyRunning(state.runs);
 }
 
 function schedulePoll(): void {
@@ -402,14 +391,7 @@ function renderToolbar(): void {
 }
 
 function filteredRuns(): Run[] {
-  const needle = state.search.trim().toLowerCase();
-  return state.runs.filter((run) => {
-    if (state.filter === "failed" && !isFailure(run.outcome)) return false;
-    if (state.filter === "running" && !statusOf(run.phase, run.outcome).active) return false;
-    if (!needle) return true;
-    const haystack = `#${run.number} ${refLabel(run)} ${run.commitSubject ?? ""}`.toLowerCase();
-    return haystack.includes(needle);
-  });
+  return filterRuns(state.runs, state.filter, state.search);
 }
 
 function renderRunColumn(): HTMLElement {
@@ -424,7 +406,7 @@ function renderRunColumn(): HTMLElement {
     ],
     activeId: state.filter,
     onChange: (id) => {
-      state.filter = id as RunFilter;
+      state.filter = parseRunFilter(id);
       tabs.update({ activeId: state.filter });
       runsView?.paint();
     },
@@ -507,7 +489,7 @@ async function loadMore(): Promise<void> {
     state.runsNext = page.next;
     render();
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 

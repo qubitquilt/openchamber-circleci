@@ -1,11 +1,12 @@
 import type { HostReadyContext } from "@openchamber/sdk";
 
 import { createCircleCIClient } from "../shared/client";
-import { attachChip, startSessionFrom, type ChipSource } from "../shared/chips";
+import { attachChip, startSessionFrom, type ChipSource } from "../shared/actions";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { duration, isFailure, refLabel, relativeTime, statusOf } from "../shared/format";
-import { host, request } from "../shared/host";
+import { host, readProjectFile, request } from "../shared/host";
+import { filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import type { StorageLike } from "../shared/storage";
 import type { Job, Run, Workflow } from "../shared/types";
@@ -37,8 +38,6 @@ if (!root) throw new Error("CircleCI picker is missing its #root element.");
 
 const client = createCircleCIClient(request);
 const storage: StorageLike = host.storage;
-
-type RunFilter = "all" | "failed" | "running";
 
 /**
  * The runs list and its filter tabs, mounted once per render of the left
@@ -106,7 +105,7 @@ async function boot(): Promise<void> {
     return;
   }
   try {
-    state.workspace = await resolveWorkspace(client, storage, state.directory);
+    state.workspace = await resolveWorkspace(client, storage, state.directory, readProjectFile);
     if (!state.workspace) {
       state.loading = false;
       render();
@@ -225,15 +224,7 @@ async function startChat(): Promise<void> {
 }
 
 function filteredRuns(): Run[] {
-  const needle = state.search.trim().toLowerCase();
-  return state.runs.filter((run) => {
-    if (state.filter === "failed" && !isFailure(run.outcome)) return false;
-    if (state.filter === "running" && !statusOf(run.phase, run.outcome).active) return false;
-    if (!needle) return true;
-    return `#${run.number} ${refLabel(run)} ${run.commitSubject ?? ""}`
-      .toLowerCase()
-      .includes(needle);
-  });
+  return filterRuns(state.runs, state.filter, state.search);
 }
 
 function render(): void {
@@ -300,7 +291,7 @@ function renderRunColumn(): HTMLElement {
     ],
     activeId: state.filter,
     onChange: (id) => {
-      state.filter = id as RunFilter;
+      state.filter = parseRunFilter(id);
       tabs.update({ activeId: state.filter });
       runsView?.paint();
     },

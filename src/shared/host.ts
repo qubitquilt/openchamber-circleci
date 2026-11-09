@@ -21,3 +21,21 @@ export const request: RequestFn = async (input) =>
     ...(input.query ? { query: input.query } : {}),
     ...(input.body === undefined ? {} : { body: input.body }),
   });
+
+/**
+ * A toast that never fails its caller. A refused toast is not a reason to
+ * break the action that produced it, and each surface also keeps its own
+ * visible line for the rail.
+ */
+export async function notify(kind: "info" | "success" | "error", message: string): Promise<void> {
+  try {
+    await host.toast({ kind, message });
+  } catch {
+    // Nothing to do: the action already happened, and the surface keeps a line.
+  }
+}
+
+/** The open project's files, shaped the way `workspace.ts` consumes them. */
+export function readProjectFile(path: string): Promise<{ content: string }> {
+  return host.readFile(path);
+}

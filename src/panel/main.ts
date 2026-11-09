@@ -1,11 +1,13 @@
 import type { HostReadyContext } from "@openchamber/sdk";
 
 import { createCircleCIClient } from "../shared/client";
-import { attachChip, promptAbout, startSessionFrom, type ChipSource } from "../shared/chips";
+import { attachChip, promptAbout, startSessionFrom, type ChipSource } from "../shared/actions";
+import { readChipData } from "../shared/chips";
 import { clear, el, metaRow } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { refLabel, relativeTime, shortSha, statusOf, isFailure, duration } from "../shared/format";
-import { host, request } from "../shared/host";
+import { host, notify, readProjectFile, request } from "../shared/host";
+import { anyRunning, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import {
   loadPipelineCache,
@@ -68,8 +70,6 @@ const client = createCircleCIClient(request);
 const storage: StorageLike = host.storage;
 
 const POLL_MS = 30_000;
-
-type RunFilter = "all" | "failed" | "running";
 
 /**
  * The runs list and its filter tabs, mounted once per visit to the runs view.
@@ -168,14 +168,6 @@ function activeWorkspace(): Workspace | null {
   return state.override ?? state.workspace;
 }
 
-async function toast(kind: "info" | "success" | "error", message: string): Promise<void> {
-  try {
-    await host.toast({ kind, message });
-  } catch {
-    // The panel still shows its own line when the host refuses a toast.
-  }
-}
-
 /* ------------------------------------------------------------------- data */
 
 async function boot(): Promise<void> {
@@ -204,7 +196,7 @@ async function boot(): Promise<void> {
     return;
   }
   try {
-    const workspace = await resolveWorkspace(client, storage, directory);
+    const workspace = await resolveWorkspace(client, storage, directory, readProjectFile);
     state.workspace = workspace;
     if (!workspace) {
       state.loading = false;
@@ -422,9 +414,9 @@ async function attach(source: ChipSource | null): Promise<void> {
   if (!source) return;
   try {
     await attachChip(source);
-    await toast("success", "Attached to the chat box.");
+    await notify("success", "Attached to the chat box.");
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
@@ -432,9 +424,9 @@ async function startSession(source: ChipSource | null): Promise<void> {
   if (!source) return;
   try {
     await startSessionFrom(source);
-    await toast("success", "Started a worktree chat for this build.");
+    await notify("success", "Started a worktree chat for this build.");
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
@@ -442,9 +434,9 @@ async function promptFix(source: ChipSource | null): Promise<void> {
   if (!source) return;
   try {
     await promptAbout(source);
-    await toast("success", "Sent to the open chat.");
+    await notify("success", "Sent to the open chat.");
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
@@ -453,10 +445,10 @@ async function promptFix(source: ChipSource | null): Promise<void> {
 async function rerun(workflow: Workflow, fromFailed: boolean): Promise<void> {
   try {
     await client.rerunWorkflow(workflow.id, fromFailed);
-    await toast("success", `Rerun started for ${workflow.name}.`);
+    await notify("success", `Rerun started for ${workflow.name}.`);
     await loadJobs();
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
@@ -469,7 +461,7 @@ async function rerunAll(fromFailed: boolean): Promise<void> {
     ? state.workflows.filter((workflow) => isFailure(workflow.outcome))
     : state.workflows;
   if (targets.length === 0) {
-    await toast("info", "No failed workflow to rerun.");
+    await notify("info", "No failed workflow to rerun.");
     return;
   }
   let started = 0;
@@ -478,20 +470,20 @@ async function rerunAll(fromFailed: boolean): Promise<void> {
       await client.rerunWorkflow(workflow.id, fromFailed);
       started += 1;
     } catch (error) {
-      await toast("error", describeError(error));
+      await notify("error", describeError(error));
     }
   }
-  if (started > 0) await toast("success", `Started ${started} rerun${started === 1 ? "" : "s"}.`);
+  if (started > 0) await notify("success", `Started ${started} rerun${started === 1 ? "" : "s"}.`);
   await loadWorkflows();
 }
 
 async function cancel(workflow: Workflow): Promise<void> {
   try {
     await client.cancelWorkflow(workflow.id);
-    await toast("success", `Cancellation requested for ${workflow.name}.`);
+    await notify("success", `Cancellation requested for ${workflow.name}.`);
     await loadJobs();
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
@@ -499,16 +491,18 @@ async function decideApproval(job: Job, approve: boolean): Promise<void> {
   try {
     if (approve) await client.approve(job.id);
     else await client.reject(job.id);
-    await toast("success", approve ? `Approved ${job.name}.` : `Rejected ${job.name}.`);
+    await notify("success", approve ? `Approved ${job.name}.` : `Rejected ${job.name}.`);
     await loadJobs();
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
 async function loadPipelines(workspace: Workspace): Promise<PipelineDefinition[]> {
+  // Never carry another project's list: reset to this project's cache first,
+  // so a failed refresh cannot leave the trigger form seeding a stale id.
   const cached = await loadPipelineCache(storage, workspace.link.projectId);
-  if (cached) state.pipelines = cached;
+  state.pipelines = cached ?? [];
   try {
     const definitions = await client.listPipelines(workspace.link.projectId);
     state.pipelines = definitions;
@@ -522,10 +516,11 @@ async function loadPipelines(workspace: Workspace): Promise<PipelineDefinition[]
 async function openTrigger(): Promise<void> {
   const workspace = activeWorkspace();
   if (!workspace) return;
-  const branch = state.directory ? await detectBranch(state.directory) : null;
+  const branch = state.directory ? await detectBranch(readProjectFile) : null;
+  state.pipelines = [];
   state.trigger = {
     loading: true,
-    pipelineId: state.pipelines[0]?.id ?? "",
+    pipelineId: "",
     branch: branch ?? "",
     error: null,
     running: false,
@@ -545,7 +540,10 @@ async function submitTrigger(): Promise<void> {
   const workspace = activeWorkspace();
   const trigger = state.trigger;
   if (!workspace || !trigger) return;
-  const pipelineId = trigger.pipelineId || state.pipelines[0]?.id;
+  const selected = state.pipelines.some((pipeline) => pipeline.id === trigger.pipelineId)
+    ? trigger.pipelineId
+    : (state.pipelines[0]?.id ?? "");
+  const pipelineId = selected;
   if (!pipelineId) {
     state.trigger = { ...trigger, error: "This project has no pipeline to run." };
     render();
@@ -566,7 +564,7 @@ async function submitTrigger(): Promise<void> {
       branch,
     });
     state.trigger = null;
-    await toast("success", `Started a run on ${branch}.`);
+    await notify("success", `Started a run on ${branch}.`);
     await loadRuns({ more: false });
   } catch (error) {
     state.trigger = {
@@ -601,6 +599,7 @@ async function onMenu(id: string): Promise<void> {
       state.selectedJob = null;
       state.jobDetail = null;
       state.jobOutput = null;
+      state.pipelines = [];
       render();
       await loadRuns({ more: false });
       return;
@@ -648,7 +647,7 @@ async function pick(project: Project): Promise<void> {
   const directory = state.directory;
   if (!directory) return;
   try {
-    const repo = await detectRepo(directory);
+    const repo = await detectRepo(readProjectFile);
     const workspace = await linkProject(storage, directory, project, repo);
     state.workspace = workspace;
     state.override = null;
@@ -656,26 +655,21 @@ async function pick(project: Project): Promise<void> {
     state.pickerProjects = [];
     state.pickerFilter = "";
     state.selectedRun = null;
+    state.pipelines = [];
     render();
     await loadRuns({ more: false });
   } catch (error) {
-    await toast("error", describeError(error));
+    await notify("error", describeError(error));
   }
 }
 
 /* ----------------------------------------------------------------- polling */
 
 function viewIsActive(): boolean {
-  if (state.selectedJob) {
-    return statusOf(state.selectedJob.phase, state.selectedJob.outcome).active;
-  }
-  if (state.selectedWorkflow) {
-    return state.jobs.some((job) => statusOf(job.phase, job.outcome).active);
-  }
-  if (state.selectedRun) {
-    return state.workflows.some((workflow) => statusOf(workflow.phase, workflow.outcome).active);
-  }
-  return state.runs.some((run) => statusOf(run.phase, run.outcome).active);
+  if (state.selectedJob) return anyRunning([state.selectedJob]);
+  if (state.selectedWorkflow) return anyRunning(state.jobs);
+  if (state.selectedRun) return anyRunning(state.workflows);
+  return anyRunning(state.runs);
 }
 
 function schedulePoll(): void {
@@ -997,7 +991,7 @@ function renderToolbar(): { bar: HTMLElement; tabs: ReturnType<typeof mountTabs>
     ],
     activeId: state.filter,
     onChange: (id) => {
-      state.filter = id as RunFilter;
+      state.filter = parseRunFilter(id);
       tabs.update({ activeId: state.filter });
       runsView?.paint();
     },
@@ -1087,13 +1081,7 @@ function noticeLine(): void {
 }
 
 function filteredRuns(): Run[] {
-  if (state.filter === "failed") {
-    return state.runs.filter((run) => isFailure(run.outcome));
-  }
-  if (state.filter === "running") {
-    return state.runs.filter((run) => statusOf(run.phase, run.outcome).active);
-  }
-  return state.runs;
+  return filterRuns(state.runs, state.filter);
 }
 
 function runRows() {
@@ -1608,14 +1596,15 @@ host.onConnection((connection) => {
 /** A chip click lands here with the data it was attached with. */
 host.onItem((item) => {
   if (!item || !("providerId" in item)) return;
-  const data = item.data as ChipData | undefined;
-  if (!data?.runId) return;
+  const data = readChipData(item.data);
+  if (!data) return;
   void openFromChip(data);
 });
 
 async function openFromChip(data: ChipData): Promise<void> {
   const workspace = activeWorkspace();
   if (workspace && workspace.link.projectId !== data.projectId) {
+    state.pipelines = [];
     state.override = {
       directory: state.directory ?? "",
       repo: null,

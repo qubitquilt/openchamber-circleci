@@ -10,12 +10,11 @@
  * 3. Nothing — the caller opens the project picker (orgs, then projects), and
  *    the user's choice is saved.
  *
- * Nothing here is fatal. A repository with no readable `.git/config` (a
- * worktree's `.git` is a file pointing outside the project, which would need
- * the `filesystem` capability) simply lands on the picker.
+ * The file read is injected rather than imported, so the git parsing paths can
+ * be tested without the SDK host. There is no cache: a branch or remote change
+ * is seen the next time a surface asks, instead of living for the iframe.
  */
 import type { CircleCIClient } from "./client";
-import { host } from "./host";
 import {
   branchFromHead,
   gitRemoteFromConfig,
@@ -36,9 +35,8 @@ export interface Workspace {
   target: WebTarget;
 }
 
-/** Reading a file per render would be wasteful; the answer cannot change mid-frame. */
-const repoCache = new Map<string, RepoRef | null>();
-const branchCache = new Map<string, string | null>();
+/** The only file read workspace detection needs; the host supplies it in the app. */
+export type ReadProjectFile = (path: string) => Promise<{ content: string }>;
 
 function workspaceOf(
   directory: string,
@@ -48,44 +46,37 @@ function workspaceOf(
   return { directory, link, repo, target: webTarget(repo, link.orgName, link.projectName) };
 }
 
-export async function detectRepo(directory: string): Promise<RepoRef | null> {
-  if (repoCache.has(directory)) return repoCache.get(directory) ?? null;
-  let repo: RepoRef | null = null;
+export async function detectRepo(readFile: ReadProjectFile): Promise<RepoRef | null> {
   try {
-    const config = await host.readFile(".git/config");
+    const config = await readFile(".git/config");
     const remote = gitRemoteFromConfig(config.content);
-    repo = remote ? parseGitRemote(remote) : null;
+    return remote ? parseGitRemote(remote) : null;
   } catch {
     // No `.git/config` in this project: the picker is the way in.
-    repo = null;
+    return null;
   }
-  repoCache.set(directory, repo);
-  return repo;
 }
 
 /** The branch the open project is on, used to prefill a trigger. */
-export async function detectBranch(directory: string): Promise<string | null> {
-  if (branchCache.has(directory)) return branchCache.get(directory) ?? null;
-  let branch: string | null = null;
+export async function detectBranch(readFile: ReadProjectFile): Promise<string | null> {
   try {
-    const head = await host.readFile(".git/HEAD");
-    branch = branchFromHead(head.content);
+    const head = await readFile(".git/HEAD");
+    return branchFromHead(head.content);
   } catch {
-    branch = null;
+    return null;
   }
-  branchCache.set(directory, branch);
-  return branch;
 }
 
 export async function resolveWorkspace(
   client: CircleCIClient,
   storage: StorageLike,
   directory: string,
+  readFile: ReadProjectFile,
 ): Promise<Workspace | null> {
   const stored = await loadProject(storage, directory);
-  if (stored) return workspaceOf(directory, stored, await detectRepo(directory));
+  if (stored) return workspaceOf(directory, stored, await detectRepo(readFile));
 
-  const repo = await detectRepo(directory);
+  const repo = await detectRepo(readFile);
   if (!repo) return null;
 
   for (const slug of slugCandidates(repo)) {
@@ -99,15 +90,18 @@ export async function resolveWorkspace(
         slug,
         source: "detected",
       });
-      const link: StoredProjectRecord = {
-        projectId: project.id,
-        projectName: project.name,
-        orgName: project.orgName,
-        slug,
-        source: "detected",
+      return workspaceOf(
         directory,
-      };
-      return workspaceOf(directory, link, repo);
+        {
+          projectId: project.id,
+          projectName: project.name,
+          orgName: project.orgName,
+          slug,
+          source: "detected",
+          directory,
+        },
+        repo,
+      );
     } catch {
       // A slug that misses or a token without access to it: try the next form.
     }
@@ -121,11 +115,12 @@ export async function linkProject(
   project: Project,
   repo: RepoRef | null,
 ): Promise<Workspace> {
+  const slug = repo ? (slugCandidates(repo)[0] ?? null) : null;
   await saveProject(storage, directory, {
     projectId: project.id,
     projectName: project.name,
     orgName: project.orgName,
-    slug: repo ? (slugCandidates(repo)[0] ?? null) : null,
+    slug,
     source: "picked",
   });
   return workspaceOf(
@@ -134,7 +129,7 @@ export async function linkProject(
       projectId: project.id,
       projectName: project.name,
       orgName: project.orgName,
-      slug: repo ? (slugCandidates(repo)[0] ?? null) : null,
+      slug,
       source: "picked",
       directory,
     },

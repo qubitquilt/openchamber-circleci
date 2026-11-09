@@ -72,8 +72,10 @@ export const RUN_PAGE_LIMIT = 20;
 export const WORKFLOW_PAGE_LIMIT = 20;
 export const PROJECT_PAGE_LIMIT = 50;
 export const PIPELINE_PAGE_LIMIT = 50;
-/** How far a single surface walks a collection before offering the next cursor instead. */
+/** How far a paginated walk goes before handing the next cursor back to the caller. */
 export const MAX_PAGES = 4;
+/** Runs a numeric `/circleci` lookup can see before it reports "not found". */
+export const RUN_SEARCH_WINDOW = MAX_PAGES * RUN_PAGE_LIMIT;
 
 /** GET retries on 429 and gateway timeouts, with a fixed backoff because `host.request` hides `Retry-After`. */
 const RETRY_DELAYS_MS = [1000, 2500];

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { CircleCIError, createCircleCIClient, RUN_PAGE_LIMIT } from "../build/client.mjs";
+import { loadPipelineCache, savePipelineCache } from "../build/storage.mjs";
 
 /** A transport that records calls and answers from a route table. */
 function transport(routes) {
@@ -380,4 +381,71 @@ test("findRunByNumber gives up after the page budget", async () => {
   });
   const client = createCircleCIClient(fn);
   assert.equal(await client.findRunByNumber("project-1", 999), null);
+});
+
+/* ------------------------------------------------------- composition paths */
+
+test("a 400 on page one retries without a limit, then pages with the cursor alone", async () => {
+  const calls = [];
+  const fn = async (input) => {
+    calls.push(input);
+    if (calls.length === 1) {
+      return json(400, { error: { type: "bad_request", title: "limit out of range" } });
+    }
+    if (calls.length === 2) return ok({ data: [runItem({ number: 20 })], page: { next: "c1" } });
+    return ok({ data: [runItem({ number: 19 })], page: { next: null } });
+  };
+  const client = createCircleCIClient(fn);
+  const run = await client.findRunByNumber("project-1", 19);
+  assert.equal(run.number, 19);
+  assert.equal(calls.length, 3);
+  // First attempt: the documented limit.
+  assert.equal(calls[0].query["page[limit]"], String(RUN_PAGE_LIMIT));
+  // The 400 retry: no limit, still no cursor.
+  assert.equal(calls[1].query["page[limit]"], undefined);
+  assert.equal(calls[1].query["page[cursor]"], undefined);
+  // The page the retry returned: its cursor travels alone.
+  assert.equal(calls[2].query["page[cursor]"], "c1");
+  assert.equal(calls[2].query["page[limit]"], undefined);
+});
+
+test("a failed pipeline detail keeps a stub and survives the cache round trip", async () => {
+  const fn = async (input) => {
+    if (input.path === "/api/v3/pipelines") {
+      return ok({ data: [{ id: "pipe-1" }, { id: "pipe-2" }] });
+    }
+    if (input.path === "/api/v3/pipelines/pipe-1") {
+      return ok({
+        data: {
+          id: "pipe-1",
+          attributes: { name: "main config", config: { file_path: ".circleci/config.yml" } },
+        },
+      });
+    }
+    return json(404, { error: { type: "not_found", title: "No pipeline" } });
+  };
+  const client = createCircleCIClient(fn);
+  const definitions = await client.listPipelines("project-1");
+  assert.equal(definitions.length, 2);
+  assert.equal(definitions[0].name, "main config");
+  assert.equal(definitions[0].configPath, ".circleci/config.yml");
+  assert.equal(definitions[1].name, "Pipeline config");
+
+  // The panel writes exactly this shape through the cache; it must come back.
+  const map = new Map();
+  const storage = {
+    async get(key) {
+      return map.get(key);
+    },
+    async set(key, value) {
+      map.set(key, value);
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+  };
+  await savePipelineCache(storage, "project-1", definitions);
+  const cached = await loadPipelineCache(storage, "project-1");
+  assert.equal(cached.length, 2);
+  assert.equal(cached[1].name, "Pipeline config");
 });

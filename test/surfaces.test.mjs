@@ -321,13 +321,13 @@ test("the panel drills run -> workflow -> job and attaches the failure with its 
   }
 });
 
-test("rerun from failed reaches the documented route and reports success", async () => {
+test("rerun from failed sends is_from_failed and reports success", async () => {
   const surface = await boot({
     html: "panel/index.html",
     script: "panel/main.js",
     surface: "panel",
     answers: routes({
-      "POST /api/v3/workflows/wf-1/rerun": () => json(201, { data: { id: "wf-2" } }),
+      "POST /api/v3/workflows/workflow-1/rerun": () => json(201, { data: { id: "workflow-2" } }),
     }),
     files: gitFiles,
   });
@@ -336,9 +336,18 @@ test("rerun from failed reaches the documented route and reports success", async
     await surface.settle();
     clickByText(surface.doc, "Rerun failed");
     await surface.settle();
+
     const rerun = surface.requests.find((entry) => entry.path.endsWith("/rerun"));
-    assert.ok(rerun);
+    assert.ok(rerun, "the rerun reached the API");
     assert.equal(rerun.method, "POST");
+    // The panel wired this button to "from failed", not to a full rerun.
+    assert.deepEqual(JSON.parse(rerun.body ?? "null"), { is_from_failed: true });
+
+    const toast = surface.calls.find(
+      (entry) => entry.type === "toast" && entry.payload?.kind === "success",
+    );
+    assert.ok(toast, "a success toast was posted");
+    assert.match(toast.payload.message, /Rerun started for build-and-test/);
   } finally {
     surface.dispose();
   }
@@ -729,6 +738,136 @@ test("the connect screen appears only when the host reports the connection gone"
     assert.match(surface.text(), /Connect CircleCI/);
     assert.doesNotMatch(surface.text(), /#12/, "the account data was forgotten");
     assert.doesNotMatch(surface.text(), /Disconnect requested/, "the stale notice was dropped");
+  } finally {
+    surface.dispose();
+  }
+});
+
+/* ------------------------------------------------------- /circleci arguments */
+
+test("/circleci reports a run number the window does not contain", async () => {
+  const surface = await boot({
+    html: "background/index.html",
+    script: "background/main.js",
+    surface: "background",
+    answers: routes(),
+    files: gitFiles,
+  });
+  try {
+    const result = await surface.resolveCommand("circleci", "95");
+    assert.ok(result, "the resolver answered");
+    assert.equal(result.payload.item, undefined, "no chip is attached");
+    assert.match(result.payload.error, /no run #95/i);
+    assert.match(result.payload.error, /80/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("/circleci refuses an argument it cannot parse instead of attaching the latest", async () => {
+  const surface = await boot({
+    html: "background/index.html",
+    script: "background/main.js",
+    surface: "background",
+    answers: routes(),
+    files: gitFiles,
+  });
+  try {
+    const result = await surface.resolveCommand("circleci", "12a");
+    assert.equal(result.payload.item, undefined);
+    assert.match(result.payload.error, /Expected a run number or run id/);
+    assert.match(result.payload.error, /12a/);
+    assert.equal(
+      surface.requests.some((entry) => entry.path === "/api/v3/runs"),
+      false,
+      "no run list was fetched for an unparseable argument",
+    );
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("/circleci with no argument still attaches the newest run", async () => {
+  const surface = await boot({
+    html: "background/index.html",
+    script: "background/main.js",
+    surface: "background",
+    answers: routes(),
+    files: gitFiles,
+  });
+  try {
+    const result = await surface.resolveCommand("circleci", "");
+    assert.match(result.payload.item.title, /#12/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+/* ---------------------------------------------------------- workspace switch */
+
+test("switching project cannot seed the trigger from the previous project's pipelines", async () => {
+  let pipelineCalls = 0;
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: routes({
+      "GET /api/v3/orgs": () =>
+        json(200, { data: [{ id: "org-1", attributes: { name: "acme" } }], page: { next: null } }),
+      "GET /api/v3/projects": () =>
+        json(200, {
+          data: [
+            project(),
+            {
+              id: "project-2",
+              attributes: { name: "api" },
+              references: { org: { id: "org-1", attributes: { name: "acme" } } },
+            },
+          ],
+          page: { next: null },
+        }),
+      // The first project lists a pipeline; the second has none and its list fails.
+      "GET /api/v3/pipelines": () => {
+        pipelineCalls += 1;
+        return pipelineCalls === 1
+          ? json(200, { data: [{ id: "pipe-old" }], page: { next: null } })
+          : json(500, { error: { type: "server_error", title: "boom" } });
+      },
+      "GET /api/v3/pipelines/pipe-old": () =>
+        json(200, {
+          data: {
+            id: "pipe-old",
+            attributes: { name: "Old pipeline", config: { file_path: ".circleci/config.yml" } },
+          },
+        }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    openProjectMenu(surface);
+    pickMenuItem(surface, "Run a pipeline…");
+    await surface.settle();
+    assert.match(surface.text(), /Old pipeline/, "the first project's pipeline is shown");
+
+    clickByText(surface.doc, "← Runs");
+    await surface.settle();
+
+    openProjectMenu(surface);
+    pickMenuItem(surface, "Change project…");
+    await surface.settle();
+    const apiRow = [...surface.doc.querySelectorAll('[role="option"]')].find((row) =>
+      (row.textContent ?? "").includes("acme/api"),
+    );
+    assert.ok(apiRow, "the second project is in the picker");
+    apiRow.click();
+    await surface.settle();
+
+    openProjectMenu(surface);
+    pickMenuItem(surface, "Run a pipeline…");
+    await surface.settle();
+
+    assert.doesNotMatch(surface.text(), /Old pipeline/, "the old project's list did not leak");
+    assert.match(surface.text(), /lists no pipeline definition/);
   } finally {
     surface.dispose();
   }

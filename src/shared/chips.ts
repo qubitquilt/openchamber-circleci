@@ -6,11 +6,12 @@
  * `data` carries the ids the panel needs to reopen the same view, and never
  * reaches the model. Every field has a host limit, so each builder clamps:
  * title 200, text and serialized data 16000, url 2000, id 128.
+ *
+ * Nothing here imports the host or a vendor type: the builders are pure, and
+ * `actions.ts` is the thin wrapper that talks to OpenChamber. That keeps the
+ * chip text, the data round trip and the limits testable under `node --test`.
  */
-import type { AttachIssueRequest, JsonValue } from "@openchamber/sdk";
-
 import { isFailure, refLabel, shortSha, statusOf } from "./format";
-import { host } from "./host";
 import { jobUrl, runUrl, workflowUrl } from "./slug";
 import type { ChipData, Job, JobDetail, Run, Workflow } from "./types";
 import type { Workspace } from "./workspace";
@@ -34,6 +35,9 @@ export interface ChipSource {
   output: string | null;
 }
 
+/** The JSON value shape a chip's `data` must satisfy. */
+export type Json = null | string | number | boolean | Json[] | { [key: string]: Json };
+
 function clamp(text: string, limit: number): string {
   if (text.length <= limit) return text;
   return `${text.slice(0, limit - 20)}\n… (truncated)`;
@@ -43,7 +47,11 @@ function statusWords(value: { phase: string; outcome: string | null }): string {
   return statusOf(value.phase, value.outcome).label.toLowerCase();
 }
 
-export function chipData(source: ChipSource): ChipData {
+/**
+ * The chip's `data`, built as an object literal so the compiler checks it
+ * against the JSON shape instead of a cast hiding a non-serializable field.
+ */
+export function chipDataJson(source: ChipSource): Json {
   const { workspace, run, workflow, job } = source;
   return {
     projectId: workspace.link.projectId,
@@ -56,6 +64,37 @@ export function chipData(source: ChipSource): ChipData {
     workflowName: workflow?.name ?? null,
     jobId: job?.id ?? null,
     jobName: job?.name ?? null,
+  };
+}
+
+function asText(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** Read back what `chipDataJson` wrote, or null when the payload is not ours. */
+export function readChipData(value: unknown): ChipData | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const projectId = asText(record.projectId);
+  const projectName = asText(record.projectName);
+  const orgName = asText(record.orgName);
+  const runId = asText(record.runId);
+  const runNumber =
+    typeof record.runNumber === "number" && Number.isFinite(record.runNumber)
+      ? record.runNumber
+      : null;
+  if (!projectId || !projectName || !orgName || !runId || runNumber === null) return null;
+  return {
+    projectId,
+    projectName,
+    orgName,
+    runId,
+    runNumber,
+    branch: asText(record.branch),
+    workflowId: asText(record.workflowId),
+    workflowName: asText(record.workflowName),
+    jobId: asText(record.jobId),
+    jobName: asText(record.jobName),
   };
 }
 
@@ -146,35 +185,7 @@ export function chipText(source: ChipSource): string {
   return clamp(lines.join("\n"), TEXT_LIMIT);
 }
 
-/** The chip every surface hands the host: attach, startSession, and `/circleci` all use it. */
-export function attachRequest(source: ChipSource): AttachIssueRequest {
-  return {
-    providerId: PROVIDER_ID,
-    id: chipId(source).slice(0, 128),
-    title: chipTitle(source),
-    url: chipUrl(source),
-    kind: "issue",
-    text: chipText(source),
-    data: chipData(source) as unknown as JsonValue,
-  };
-}
-
-/** Attach as a chip on the composer. Replaces whatever chip is there. */
-export async function attachChip(source: ChipSource): Promise<void> {
-  await host.attach(attachRequest(source));
-}
-
-/** Start a fresh chat in a worktree, with this chip and a first message. */
-export async function startSessionFrom(source: ChipSource): Promise<void> {
-  await host.startSession({
-    ...attachRequest(source),
-    worktree: true,
-    navigation: "open",
-  });
-}
-
-/** Ask the open chat to look at this failure without attaching anything. */
-export async function promptAbout(source: ChipSource): Promise<void> {
-  const text = `Investigate and fix this CircleCI failure.\n\n${chipText(source)}`;
-  await host.prompt({ text: clamp(text, TEXT_LIMIT), send: true });
+/** The first message a "fix this" session gets. */
+export function chipPrompt(source: ChipSource): string {
+  return clamp(`Investigate and fix this CircleCI failure.\n\n${chipText(source)}`, TEXT_LIMIT);
 }

@@ -13,10 +13,11 @@ tests.
 
 ```
 src/shared/     code every surface shares: the API client (`client.ts`), the wire and view types
-                (`types.ts`), status/time formatting (`format.ts`), git remotes and web URLs (`slug.ts`),
-                storage and its sanitizers (`storage.ts`), project resolution (`workspace.ts`), chip
-                builders (`chips.ts`), the stylesheet (`styles.ts`), the DOM helper (`dom.ts`), error
-                text (`errors.ts`) and the host client (`host.ts`)
+                (`types.ts`), status/time formatting (`format.ts`), the run filter and poll predicate
+                (`runs.ts`), git remotes and web URLs (`slug.ts`), storage and its sanitizers
+                (`storage.ts`), project resolution (`workspace.ts`), chip builders (`chips.ts`), the
+                chip host calls (`actions.ts`), the stylesheet (`styles.ts`), the DOM helper (`dom.ts`),
+                error text (`errors.ts`) and the host client (`host.ts`)
 src/panel/      the rail panel        -> panel/main.js
 src/page/       the full-screen page  -> panel/page.js
 src/attach/     the + picker          -> panel/attach.js

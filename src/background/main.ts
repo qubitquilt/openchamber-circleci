@@ -13,10 +13,10 @@
  */
 import type { HostReadyContext } from "@openchamber/sdk";
 
-import { createCircleCIClient } from "../shared/client";
-import { attachRequest } from "../shared/chips";
+import { createCircleCIClient, RUN_SEARCH_WINDOW } from "../shared/client";
+import { attachRequest } from "../shared/actions";
 import { refLabel, relativeTime, statusOf } from "../shared/format";
-import { host, request } from "../shared/host";
+import { host, notify, readProjectFile, request } from "../shared/host";
 import type { StorageLike } from "../shared/storage";
 import type { Run } from "../shared/types";
 import { resolveWorkspace, type Workspace } from "../shared/workspace";
@@ -43,20 +43,30 @@ async function latestRun(workspace: Workspace): Promise<Run | null> {
   return page.items[0] ?? null;
 }
 
-async function findRun(workspace: Workspace, argument: string): Promise<Run | null> {
-  if (!argument) return latestRun(workspace);
-  if (/^\d+$/.test(argument)) {
-    const number = Number(argument);
-    return (await client.findRunByNumber(workspace.link.projectId, number)) ?? null;
+async function findRun(workspace: Workspace, argument: string): Promise<Run> {
+  const trimmed = argument.trim();
+  if (!trimmed) {
+    const latest = await latestRun(workspace);
+    if (!latest) throw new Error("CircleCI has no runs for this project yet.");
+    return latest;
   }
-  if (UUID.test(argument)) {
+  if (/^\d+$/.test(trimmed)) {
+    const run = await client.findRunByNumber(workspace.link.projectId, Number(trimmed));
+    if (!run) {
+      throw new Error(
+        `CircleCI has no run #${trimmed} in the most recent ${RUN_SEARCH_WINDOW} runs of this project.`,
+      );
+    }
+    return run;
+  }
+  if (UUID.test(trimmed)) {
     try {
-      return await client.getRun(argument);
+      return await client.getRun(trimmed);
     } catch {
-      return null;
+      throw new Error(`CircleCI has no run ${trimmed}.`);
     }
   }
-  return latestRun(workspace);
+  throw new Error(`Expected a run number or run id after /circleci, not "${trimmed}".`);
 }
 
 /** `/circleci 123` or `/circleci <run id>`: attach the run as a chip. */
@@ -64,11 +74,14 @@ host.onResolve(async ({ command, args }) => {
   if (command !== "circleci") return null;
   const ctx = await ready;
   const directory = ctx.directory;
-  if (!directory) return null;
-  const workspace = await resolveWorkspace(client, storage, directory);
-  if (!workspace) return null;
+  if (!directory) throw new Error("Open a project in OpenChamber first.");
+  const workspace = await resolveWorkspace(client, storage, directory, readProjectFile);
+  if (!workspace) {
+    throw new Error(
+      "Open the CircleCI panel once to choose which CircleCI project this repository maps to.",
+    );
+  }
   const run = await findRun(workspace, args.trim());
-  if (!run) return null;
   return attachRequest({
     workspace,
     run,
@@ -84,24 +97,23 @@ host.onResolve(async ({ command, args }) => {
 host.onAction(async (item) => {
   const directory = item.directory;
   if (!directory) throw new Error("This chat has no project directory.");
-  const workspace = await resolveWorkspace(client, storage, directory);
+  const workspace = await resolveWorkspace(client, storage, directory, readProjectFile);
   if (!workspace) {
-    await host.toast({
-      kind: "error",
-      message:
-        "Open the CircleCI panel once to choose which CircleCI project this repository maps to.",
-    });
+    await notify(
+      "error",
+      "Open the CircleCI panel once to choose which CircleCI project this repository maps to.",
+    );
     return;
   }
   const run = await latestRun(workspace);
   if (!run) {
-    await host.toast({ kind: "info", message: "CircleCI has no runs for this project yet." });
+    await notify("info", "CircleCI has no runs for this project yet.");
     return;
   }
   const status = statusOf(run.phase, run.outcome);
   const kind = status.tone === "success" ? "success" : status.tone === "error" ? "error" : "info";
-  await host.toast({
+  await notify(
     kind,
-    message: `CircleCI #${run.number} ${refLabel(run)}: ${status.label} · ${relativeTime(run.createdAt)}`,
-  });
+    `CircleCI #${run.number} ${refLabel(run)}: ${status.label} · ${relativeTime(run.createdAt)}`,
+  );
 });
