@@ -1,7 +1,8 @@
 import type { HostReadyContext } from "@openchamber/sdk";
 
 import { createCircleCIClient } from "../shared/client";
-import { attachChip, startSessionFrom, type ChipSource } from "../shared/actions";
+import { attachChip, startSessionFrom } from "../shared/actions";
+import type { ChipSource } from "../shared/chips";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { duration, isFailure, refLabel, relativeTime, statusOf } from "../shared/format";
@@ -20,6 +21,7 @@ import {
   mountList,
   mountSearchField,
   mountTabs,
+  providerNotice,
   spinnerHolder,
 } from "../shared/ui";
 import { resolveWorkspace, type Workspace } from "../shared/workspace";
@@ -63,6 +65,8 @@ interface PickerState {
   selectedRun: Run | null;
   workflows: Workflow[];
   jobs: Record<string, Job[]>;
+  /** Why a workflow's job list is missing, when CircleCI refused the read. */
+  jobErrors: Record<string, string>;
   selectedWorkflowId: string | null;
   loading: boolean;
   loadingDetail: boolean;
@@ -82,6 +86,7 @@ const state: PickerState = {
   selectedRun: null,
   workflows: [],
   jobs: {},
+  jobErrors: {},
   selectedWorkflowId: null,
   loading: true,
   loadingDetail: false,
@@ -159,6 +164,7 @@ async function selectRun(run: Run): Promise<void> {
     const workflows = await client.listWorkflows(run.id);
     if (token !== renderToken) return;
     state.workflows = workflows.items;
+    state.jobErrors = {};
     const results = await Promise.allSettled(
       workflows.items.map((workflow) => client.listJobs(workflow.id)),
     );
@@ -166,7 +172,13 @@ async function selectRun(run: Run): Promise<void> {
     for (const [index, result] of results.entries()) {
       const workflow = workflows.items[index];
       if (!workflow) continue;
-      state.jobs[workflow.id] = result.status === "fulfilled" ? result.value.items : [];
+      if (result.status === "fulfilled") {
+        state.jobs[workflow.id] = result.value.items;
+      } else {
+        // Keep the reason: a failed read is not the same as zero jobs.
+        state.jobs[workflow.id] = [];
+        state.jobErrors[workflow.id] = describeError(result.reason);
+      }
     }
     const failing = workflows.items.find((workflow) => isFailure(workflow.outcome));
     setSelection(failing ?? workflows.items[0] ?? null);
@@ -413,7 +425,12 @@ function renderPreviewColumn(): HTMLElement {
 
     const jobs = state.jobs[workflow.id] ?? [];
     const failing = jobs.filter((job) => isFailure(job.outcome));
-    if (failing.length > 0) {
+    const jobFailure = state.jobErrors[workflow.id];
+    if (jobFailure) {
+      row.append(
+        providerNotice(`Could not list this workflow's jobs: ${jobFailure}`, "notice error-text"),
+      );
+    } else if (failing.length > 0) {
       row.append(
         el("p", { className: "notice" }, `Failing: ${failing.map((job) => job.name).join(", ")}`),
       );

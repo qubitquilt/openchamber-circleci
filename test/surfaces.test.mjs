@@ -872,3 +872,86 @@ test("switching project cannot seed the trigger from the previous project's pipe
     surface.dispose();
   }
 });
+
+/* ------------------------------------------------------- failed job listings */
+
+const jobsFail = () =>
+  json(500, { error: { type: "server_error", detail: "the job log store is unavailable" } });
+
+test("the page says a workflow's jobs could not be read instead of showing none", async () => {
+  const surface = await boot({
+    html: "panel/page.html",
+    script: "panel/page.js",
+    surface: "page",
+    answers: routes({ "GET /api/v3/jobs": jobsFail }),
+    files: gitFiles,
+  });
+  try {
+    assert.match(surface.text(), /Could not list this workflow's jobs/);
+    assert.match(surface.text(), /job log store is unavailable/);
+    assert.doesNotMatch(surface.text(), /No jobs listed/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the picker says a workflow's jobs could not be read instead of looking empty", async () => {
+  const surface = await boot({
+    html: "panel/attach.html",
+    script: "panel/attach.js",
+    surface: "dialog",
+    answers: routes({ "GET /api/v3/jobs": jobsFail }),
+    files: gitFiles,
+  });
+  try {
+    assert.match(surface.text(), /Could not list this workflow's jobs/);
+    assert.match(surface.text(), /job log store is unavailable/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+/* ---------------------------------------------------- /circleci run-id errors */
+
+const runId = "123e4567-e89b-12d3-a456-426614174000";
+
+test("/circleci by run id surfaces a server error instead of claiming it is missing", async () => {
+  const surface = await boot({
+    html: "background/index.html",
+    script: "background/main.js",
+    surface: "background",
+    answers: routes({
+      [`GET /api/v3/runs/${runId}`]: () =>
+        json(500, { error: { type: "server_error", detail: "CircleCI is down" } }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    const result = await surface.resolveCommand("circleci", runId);
+    assert.equal(result.payload.item, undefined);
+    assert.match(result.payload.error, /CircleCI is down/);
+    assert.doesNotMatch(result.payload.error, /has no run/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("/circleci by run id still reports a genuine 404 as a missing run", async () => {
+  const surface = await boot({
+    html: "background/index.html",
+    script: "background/main.js",
+    surface: "background",
+    answers: routes({
+      [`GET /api/v3/runs/${runId}`]: () =>
+        json(404, { error: { type: "not_found", title: "No run" } }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    const result = await surface.resolveCommand("circleci", runId);
+    assert.equal(result.payload.item, undefined);
+    assert.match(result.payload.error, /has no run/);
+  } finally {
+    surface.dispose();
+  }
+});

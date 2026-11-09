@@ -18,7 +18,7 @@ export function parseRunFilter(value: string): RunFilter {
 }
 
 /** One haystack for the filter box, so no surface matches a different set of fields. */
-export function runHaystack(run: Run): string {
+function runHaystack(run: Run): string {
   return [
     `#${run.number}`,
     refLabel(run),
@@ -31,6 +31,11 @@ export function runHaystack(run: Run): string {
     .toLowerCase();
 }
 
+/**
+ * The `running` tab means "may still move", not "phase is literally running":
+ * a run on hold or blocked is still a run the user is waiting on, and it is
+ * what arms polling. The predicate name says `active` for that reason.
+ */
 export function runMatches(run: Run, filter: RunFilter, search = ""): boolean {
   if (filter === "failed" && !isFailure(run.outcome)) return false;
   if (filter === "running" && !statusOf(run.phase, run.outcome).active) return false;
@@ -42,12 +47,15 @@ export function filterRuns(runs: Run[], filter: RunFilter, search = ""): Run[] {
   return runs.filter((run) => runMatches(run, filter, search));
 }
 
-export interface Activity {
+interface Activity {
   phase: string;
   outcome: string | null;
 }
 
-/** True while any run, workflow or job may still move, which is what arms polling. */
-export function anyRunning(items: Activity[]): boolean {
+/**
+ * True while any run, workflow or job may still move, which is what arms
+ * polling. "Active" rather than "running": on-hold and blocked count.
+ */
+export function anyActive(items: Activity[]): boolean {
   return items.some((item) => statusOf(item.phase, item.outcome).active);
 }

@@ -1,14 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  RUN_FILTERS,
-  anyRunning,
-  filterRuns,
-  parseRunFilter,
-  runHaystack,
-  runMatches,
-} from "../build/runs.mjs";
+import { RUN_FILTERS, anyActive, filterRuns, parseRunFilter, runMatches } from "../build/runs.mjs";
 
 function run(overrides = {}) {
   return {
@@ -84,14 +77,14 @@ test("search composes with a filter rather than replacing it", () => {
   );
 });
 
-test("the haystack is lowercased and includes the pipeline name", () => {
-  assert.match(runHaystack(run()), /main config/);
-  assert.equal(runHaystack(run()), runHaystack(run()).toLowerCase());
+test("search is case-insensitive and includes the pipeline name", () => {
+  assert.equal(runMatches(run(), "all", "MAIN CONFIG"), true);
+  assert.equal(runMatches(run(), "all", "FIX THE LOGIN"), true);
 });
 
-test("anyRunning is true only while something can still move", () => {
-  assert.equal(anyRunning([{ phase: "ended", outcome: "succeeded" }]), false);
-  assert.equal(anyRunning([{ phase: "queued", outcome: null }]), true);
-  assert.equal(anyRunning([{ phase: "ended", outcome: "on_hold" }]), true);
-  assert.equal(anyRunning([]), false);
+test("anyActive is true only while something can still move", () => {
+  assert.equal(anyActive([{ phase: "ended", outcome: "succeeded" }]), false);
+  assert.equal(anyActive([{ phase: "queued", outcome: null }]), true);
+  assert.equal(anyActive([{ phase: "ended", outcome: "on_hold" }]), true);
+  assert.equal(anyActive([]), false);
 });

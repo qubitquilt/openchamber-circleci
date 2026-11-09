@@ -1,13 +1,20 @@
 import type { HostReadyContext } from "@openchamber/sdk";
 
 import { createCircleCIClient } from "../shared/client";
-import { attachChip, startSessionFrom, type ChipSource } from "../shared/actions";
+import { attachChip, startSessionFrom } from "../shared/actions";
+import type { ChipSource } from "../shared/chips";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { duration, isFailure, refLabel, relativeTime, shortSha, statusOf } from "../shared/format";
 import { host, notify, readProjectFile, request } from "../shared/host";
-import { anyRunning, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
+import { createPoller } from "../shared/poll";
+import { anyActive, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
+import {
+  cancelWorkflow as requestCancel,
+  decideApproval as requestApproval,
+  rerunWorkflow as requestRerun,
+} from "../shared/workflow-actions";
 import { loadPreferences, savePreferences, type StorageLike } from "../shared/storage";
 import type { Job, Preferences, Run, Workflow } from "../shared/types";
 import {
@@ -70,6 +77,8 @@ interface PageState {
   selectedRun: Run | null;
   workflows: Workflow[];
   jobs: Record<string, Job[]>;
+  /** Why a workflow's job list is missing, when CircleCI refused the read. */
+  jobErrors: Record<string, string>;
   preferences: Preferences;
   loading: boolean;
   loadingDetail: boolean;
@@ -89,6 +98,7 @@ const state: PageState = {
   selectedRun: null,
   workflows: [],
   jobs: {},
+  jobErrors: {},
   preferences: { autoRefresh: true },
   loading: true,
   loadingDetail: false,
@@ -96,7 +106,6 @@ const state: PageState = {
 };
 
 let renderToken = 0;
-let pollTimer: number | null = null;
 
 /* ------------------------------------------------------------------- data */
 
@@ -175,6 +184,7 @@ async function selectRun(run: Run): Promise<void> {
     const workflows = await client.listWorkflows(run.id);
     if (token !== renderToken) return;
     state.workflows = workflows.items;
+    state.jobErrors = {};
     const results = await Promise.allSettled(
       workflows.items.map((workflow) => client.listJobs(workflow.id)),
     );
@@ -182,7 +192,13 @@ async function selectRun(run: Run): Promise<void> {
     for (const [index, result] of results.entries()) {
       const workflow = workflows.items[index];
       if (!workflow) continue;
-      state.jobs[workflow.id] = result.status === "fulfilled" ? result.value.items : [];
+      if (result.status === "fulfilled") {
+        state.jobs[workflow.id] = result.value.items;
+      } else {
+        // Keep the reason: a failed read is not the same as zero jobs.
+        state.jobs[workflow.id] = [];
+        state.jobErrors[workflow.id] = describeError(result.reason);
+      }
     }
     state.loadingDetail = false;
   } catch (error) {
@@ -242,53 +258,33 @@ async function startSession(source: ChipSource | null): Promise<void> {
 }
 
 async function rerun(workflow: Workflow, fromFailed: boolean): Promise<void> {
-  try {
-    await client.rerunWorkflow(workflow.id, fromFailed);
-    await notify("success", `Rerun started for ${workflow.name}.`);
-    await refreshDetail();
-  } catch (error) {
-    await notify("error", describeError(error));
-  }
+  if (await requestRerun(client, workflow, fromFailed, notify)) await refreshDetail();
 }
 
 async function cancel(workflow: Workflow): Promise<void> {
-  try {
-    await client.cancelWorkflow(workflow.id);
-    await notify("success", `Cancellation requested for ${workflow.name}.`);
-    await refreshDetail();
-  } catch (error) {
-    await notify("error", describeError(error));
-  }
+  if (await requestCancel(client, workflow, notify)) await refreshDetail();
 }
 
 async function decideApproval(job: Job, approve: boolean): Promise<void> {
-  try {
-    if (approve) await client.approve(job.id);
-    else await client.reject(job.id);
-    await notify("success", approve ? `Approved ${job.name}.` : `Rejected ${job.name}.`);
-    await refreshDetail();
-  } catch (error) {
-    await notify("error", describeError(error));
-  }
+  if (await requestApproval(client, job, approve, notify)) await refreshDetail();
 }
 
 /* ----------------------------------------------------------------- polling */
 
 function viewIsActive(): boolean {
-  if (state.selectedRun) return anyRunning(state.workflows);
-  return anyRunning(state.runs);
+  if (state.selectedRun) return anyActive(state.workflows);
+  return anyActive(state.runs);
 }
 
+const poller = createPoller({
+  delayMs: POLL_MS,
+  enabled: () => state.preferences.autoRefresh,
+  active: viewIsActive,
+  onTick: () => void refreshDetail(),
+});
+
 function schedulePoll(): void {
-  if (pollTimer !== null) {
-    window.clearTimeout(pollTimer);
-    pollTimer = null;
-  }
-  if (!state.preferences.autoRefresh || !viewIsActive()) return;
-  pollTimer = window.setTimeout(() => {
-    pollTimer = null;
-    void refreshDetail();
-  }, POLL_MS);
+  poller.arm();
 }
 
 /* ------------------------------------------------------------------ render */
@@ -613,6 +609,13 @@ function renderWorkflow(workflow: Workflow, run: Run): HTMLElement {
   actions.append(openHolder);
   section.append(actions);
 
+  const jobFailure = state.jobErrors[workflow.id];
+  if (jobFailure) {
+    section.append(
+      providerNotice(`Could not list this workflow's jobs: ${jobFailure}`, "notice error-text"),
+    );
+    return section;
+  }
   const jobs = state.jobs[workflow.id] ?? [];
   if (jobs.length === 0) {
     section.append(el("p", { className: "notice" }, "No jobs listed."));

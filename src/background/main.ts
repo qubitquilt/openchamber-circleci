@@ -13,7 +13,7 @@
  */
 import type { HostReadyContext } from "@openchamber/sdk";
 
-import { createCircleCIClient, RUN_SEARCH_WINDOW } from "../shared/client";
+import { createCircleCIClient, CircleCIError, RUN_SEARCH_WINDOW } from "../shared/client";
 import { attachRequest } from "../shared/actions";
 import { refLabel, relativeTime, statusOf } from "../shared/format";
 import { host, notify, readProjectFile, request } from "../shared/host";
@@ -62,8 +62,14 @@ async function findRun(workspace: Workspace, argument: string): Promise<Run> {
   if (UUID.test(trimmed)) {
     try {
       return await client.getRun(trimmed);
-    } catch {
-      throw new Error(`CircleCI has no run ${trimmed}.`);
+    } catch (error) {
+      // Only a 404 means "no such run". A 401, a 429 or a server error must
+      // reach the user as itself, not as a missing run they should stop
+      // looking for.
+      if (error instanceof CircleCIError && error.status === 404) {
+        throw new Error(`CircleCI has no run ${trimmed}.`);
+      }
+      throw error;
     }
   }
   throw new Error(`Expected a run number or run id after /circleci, not "${trimmed}".`);

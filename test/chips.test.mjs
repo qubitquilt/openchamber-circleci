@@ -216,3 +216,16 @@ test("the chip reader refuses anything that is not its own payload", () => {
   assert.equal(readChipData({ ...chipDataJson(source()), runNumber: "12" }), null);
   assert.equal(readChipData({ ...chipDataJson(source()), runId: "" }), null);
 });
+
+test("a chip for a project with no organization name still reopens", () => {
+  const bare = {
+    ...workspace,
+    link: { ...workspace.link, orgName: "" },
+  };
+  const json = chipDataJson(source({ workspace: bare }));
+  assert.equal(json.orgName, "");
+  const data = readChipData(json);
+  assert.ok(data, "the chip is accepted");
+  assert.equal(data.orgName, "");
+  assert.equal(data.runId, "run-1");
+});

@@ -77,13 +77,15 @@ export function readChipData(value: unknown): ChipData | null {
   const record = value as Record<string, unknown>;
   const projectId = asText(record.projectId);
   const projectName = asText(record.projectName);
-  const orgName = asText(record.orgName);
+  // A project whose org name the API did not return is stored as "", so the
+  // org name is blank-but-valid here; requiring it would refuse a chip we wrote.
+  const orgName = asText(record.orgName) ?? "";
   const runId = asText(record.runId);
   const runNumber =
     typeof record.runNumber === "number" && Number.isFinite(record.runNumber)
       ? record.runNumber
       : null;
-  if (!projectId || !projectName || !orgName || !runId || runNumber === null) return null;
+  if (!projectId || !projectName || !runId || runNumber === null) return null;
   return {
     projectId,
     projectName,

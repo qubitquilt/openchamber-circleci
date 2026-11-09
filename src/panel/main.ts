@@ -1,14 +1,20 @@
 import type { HostReadyContext } from "@openchamber/sdk";
 
 import { createCircleCIClient } from "../shared/client";
-import { attachChip, promptAbout, startSessionFrom, type ChipSource } from "../shared/actions";
-import { readChipData } from "../shared/chips";
+import { attachChip, promptAbout, startSessionFrom } from "../shared/actions";
+import { readChipData, type ChipSource } from "../shared/chips";
 import { clear, el, metaRow } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { refLabel, relativeTime, shortSha, statusOf, isFailure, duration } from "../shared/format";
 import { host, notify, readProjectFile, request } from "../shared/host";
-import { anyRunning, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
+import { createPoller } from "../shared/poll";
+import { anyActive, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
+import {
+  cancelWorkflow as requestCancel,
+  decideApproval as requestApproval,
+  rerunWorkflow as requestRerun,
+} from "../shared/workflow-actions";
 import {
   loadPipelineCache,
   loadPreferences,
@@ -162,7 +168,6 @@ const state: PanelState = {
 
 /** A newer load always wins, so a slow answer never paints over a newer one. */
 let renderToken = 0;
-let pollTimer: number | null = null;
 
 function activeWorkspace(): Workspace | null {
   return state.override ?? state.workspace;
@@ -443,13 +448,7 @@ async function promptFix(source: ChipSource | null): Promise<void> {
 /* ----------------------------------------------------------------- actions */
 
 async function rerun(workflow: Workflow, fromFailed: boolean): Promise<void> {
-  try {
-    await client.rerunWorkflow(workflow.id, fromFailed);
-    await notify("success", `Rerun started for ${workflow.name}.`);
-    await loadJobs();
-  } catch (error) {
-    await notify("error", describeError(error));
-  }
+  if (await requestRerun(client, workflow, fromFailed, notify)) await loadJobs();
 }
 
 /**
@@ -478,24 +477,11 @@ async function rerunAll(fromFailed: boolean): Promise<void> {
 }
 
 async function cancel(workflow: Workflow): Promise<void> {
-  try {
-    await client.cancelWorkflow(workflow.id);
-    await notify("success", `Cancellation requested for ${workflow.name}.`);
-    await loadJobs();
-  } catch (error) {
-    await notify("error", describeError(error));
-  }
+  if (await requestCancel(client, workflow, notify)) await loadJobs();
 }
 
 async function decideApproval(job: Job, approve: boolean): Promise<void> {
-  try {
-    if (approve) await client.approve(job.id);
-    else await client.reject(job.id);
-    await notify("success", approve ? `Approved ${job.name}.` : `Rejected ${job.name}.`);
-    await loadJobs();
-  } catch (error) {
-    await notify("error", describeError(error));
-  }
+  if (await requestApproval(client, job, approve, notify)) await loadJobs();
 }
 
 async function loadPipelines(workspace: Workspace): Promise<PipelineDefinition[]> {
@@ -666,23 +652,21 @@ async function pick(project: Project): Promise<void> {
 /* ----------------------------------------------------------------- polling */
 
 function viewIsActive(): boolean {
-  if (state.selectedJob) return anyRunning([state.selectedJob]);
-  if (state.selectedWorkflow) return anyRunning(state.jobs);
-  if (state.selectedRun) return anyRunning(state.workflows);
-  return anyRunning(state.runs);
+  if (state.selectedJob) return anyActive([state.selectedJob]);
+  if (state.selectedWorkflow) return anyActive(state.jobs);
+  if (state.selectedRun) return anyActive(state.workflows);
+  return anyActive(state.runs);
 }
 
+const poller = createPoller({
+  delayMs: POLL_MS,
+  enabled: () => state.preferences.autoRefresh,
+  active: viewIsActive,
+  onTick: () => void refreshCurrent(true),
+});
+
 function schedulePoll(): void {
-  if (pollTimer !== null) {
-    window.clearTimeout(pollTimer);
-    pollTimer = null;
-  }
-  if (!state.preferences.autoRefresh) return;
-  if (!viewIsActive()) return;
-  pollTimer = window.setTimeout(() => {
-    pollTimer = null;
-    void refreshCurrent(true);
-  }, POLL_MS);
+  poller.arm();
 }
 
 function updateBadge(): void {
