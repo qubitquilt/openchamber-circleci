@@ -101,18 +101,37 @@ test("a batch rerun reports one aggregate result", async () => {
     { fromFailed: true },
     notify,
   );
-  assert.deepEqual(result, { started: 1, failed: 1 });
-  assert.deepEqual(calls, [
-    { kind: "success", message: "Started 1 rerun." },
-    { kind: "error", message: "1 rerun could not be started." },
+  assert.deepEqual(result, { started: 1, failed: 1, reasons: ["nope"] });
+  assert.match(calls[0]?.message ?? "", /Started 1 rerun\./);
+  assert.equal(calls[1]?.kind, "error");
+  assert.match(calls[1]?.message ?? "", /1 rerun could not be started: nope\./);
+});
+
+test("a batch rerun forwards fromFailed to every workflow", async () => {
+  const seen = [];
+  const client = {
+    async rerunWorkflow(id, fromFailed) {
+      seen.push({ id, fromFailed });
+    },
+  };
+  const onlyFailed = recorder();
+  await rerunWorkflows(client, [workflow, otherWorkflow], { fromFailed: true }, onlyFailed.notify);
+  assert.deepEqual(seen, [
+    { id: "wf-1", fromFailed: true },
+    { id: "wf-2", fromFailed: true },
   ]);
+
+  const whole = recorder();
+  seen.length = 0;
+  await rerunWorkflows(client, [workflow], { fromFailed: false }, whole.notify);
+  assert.deepEqual(seen, [{ id: "wf-1", fromFailed: false }]);
 });
 
 test("a batch rerun with nothing to do says so, without a success claim", async () => {
   const { notify, calls } = recorder();
   const client = { rerunWorkflow: async () => undefined };
   const fromFailed = await rerunWorkflows(client, [], { fromFailed: true }, notify);
-  assert.deepEqual(fromFailed, { started: 0, failed: 0 });
+  assert.deepEqual(fromFailed, { started: 0, failed: 0, reasons: [] });
   assert.deepEqual(calls, [{ kind: "info", message: "No failed workflow to rerun." }]);
 
   const whenEmpty = recorder();
@@ -122,7 +141,7 @@ test("a batch rerun with nothing to do says so, without a success claim", async 
   ]);
 });
 
-test("a batch rerun where every call fails reports only the failure", async () => {
+test("a batch rerun where every call fails reports the reason", async () => {
   const { notify, calls } = recorder();
   const client = {
     async rerunWorkflow() {
@@ -130,6 +149,31 @@ test("a batch rerun where every call fails reports only the failure", async () =
     },
   };
   const result = await rerunWorkflows(client, [workflow], { fromFailed: false }, notify);
-  assert.deepEqual(result, { started: 0, failed: 1 });
-  assert.deepEqual(calls, [{ kind: "error", message: "1 rerun could not be started." }]);
+  assert.deepEqual(result, { started: 0, failed: 1, reasons: ["boom"] });
+  assert.deepEqual(calls, [{ kind: "error", message: "1 rerun could not be started: boom." }]);
+});
+
+test("a batch rerun keeps each distinct reason and counts the rest", async () => {
+  const { notify, calls } = recorder();
+  const client = {
+    async rerunWorkflow(id) {
+      if (id === "wf-1") throw new Error("This token cannot see that resource.");
+      throw new Error("CircleCI is rate limiting this token.");
+    },
+  };
+  const result = await rerunWorkflows(
+    client,
+    [workflow, otherWorkflow, { id: "wf-3", name: "third" }],
+    { fromFailed: true },
+    notify,
+  );
+  assert.deepEqual(result.reasons, [
+    "This token cannot see that resource.",
+    "CircleCI is rate limiting this token.",
+  ]);
+  assert.equal(result.failed, 3);
+  assert.match(
+    calls[0]?.message ?? "",
+    /3 reruns could not be started: This token cannot see that resource\. \(\+1 more\)\./,
+  );
 });

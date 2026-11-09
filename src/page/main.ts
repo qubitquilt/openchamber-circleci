@@ -267,11 +267,12 @@ async function cancel(workflow: Workflow): Promise<void> {
   if (await requestCancel(client, workflow, notify)) await refreshDetail();
 }
 
-async function decideApproval(job: Job, approve: boolean): Promise<void> {
-  const done = approve
-    ? await requestApprove(client, job, notify)
-    : await requestReject(client, job, notify);
-  if (done) await refreshDetail();
+async function approveHold(job: Job): Promise<void> {
+  if (await requestApprove(client, job, notify)) await refreshDetail();
+}
+
+async function rejectHold(job: Job): Promise<void> {
+  if (await requestReject(client, job, notify)) await refreshDetail();
 }
 
 /* ----------------------------------------------------------------- polling */
@@ -650,7 +651,7 @@ function renderWorkflow(workflow: Workflow, run: Run): HTMLElement {
       mountButton(approve, {
         label: "Approve",
         size: "xs",
-        onClick: () => void decideApproval(job, true),
+        onClick: () => void approveHold(job),
       });
       jobActions.append(approve);
       const reject = el("div");
@@ -658,7 +659,7 @@ function renderWorkflow(workflow: Workflow, run: Run): HTMLElement {
         label: "Reject",
         size: "xs",
         variant: "ghost",
-        onClick: () => void decideApproval(job, false),
+        onClick: () => void rejectHold(job),
       });
       jobActions.append(reject);
     }

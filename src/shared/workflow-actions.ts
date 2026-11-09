@@ -37,11 +37,15 @@ export async function rerunWorkflow(
 export interface BatchResult {
   started: number;
   failed: number;
+  /** Distinct failure reasons, in the order they first appeared. */
+  reasons: string[];
 }
 
 /**
  * Rerun several workflows with one aggregate report, which is what a run's
  * "Rerun" menu needs. A single-workflow rerun uses `rerunWorkflow` instead.
+ * The first failure reason travels with the report, because "N reruns could
+ * not be started" alone tells the user nothing actionable.
  */
 export async function rerunWorkflows(
   client: CircleCIClient,
@@ -54,25 +58,33 @@ export async function rerunWorkflows(
       "info",
       options.fromFailed ? "No failed workflow to rerun." : "This run has no workflows to rerun.",
     );
-    return { started: 0, failed: 0 };
+    return { started: 0, failed: 0, reasons: [] };
   }
   let started = 0;
   let failed = 0;
+  const reasons: string[] = [];
   for (const workflow of workflows) {
     try {
       await client.rerunWorkflow(workflow.id, options.fromFailed);
       started += 1;
-    } catch {
+    } catch (error) {
       failed += 1;
+      const reason = describeError(error);
+      if (!reasons.includes(reason)) reasons.push(reason);
     }
   }
   if (started > 0) {
     await notify("success", `Started ${started} rerun${started === 1 ? "" : "s"}.`);
   }
   if (failed > 0) {
-    await notify("error", `${failed} rerun${failed === 1 ? "" : "s"} could not be started.`);
+    const first = reasons[0];
+    const rest = reasons.length - 1;
+    await notify(
+      "error",
+      `${failed} rerun${failed === 1 ? "" : "s"} could not be started${first ? `: ${first}` : ""}${rest > 0 ? ` (+${rest} more)` : ""}.`,
+    );
   }
-  return { started, failed };
+  return { started, failed, reasons };
 }
 
 /** Request cancellation. True when CircleCI accepted it. */

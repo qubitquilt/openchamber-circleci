@@ -15,25 +15,10 @@ import {
   cancelWorkflow as requestCancel,
   rejectJob as requestReject,
   rerunWorkflow as requestRerun,
-  rerunWorkflows as requestReruns,
+  rerunWorkflows as requestRerunBatch,
 } from "../shared/workflow-actions";
-import {
-  loadPipelineCache,
-  loadPreferences,
-  savePipelineCache,
-  savePreferences,
-  type StorageLike,
-} from "../shared/storage";
-import type {
-  ChipData,
-  Job,
-  JobDetail,
-  PipelineDefinition,
-  Preferences,
-  Project,
-  Run,
-  Workflow,
-} from "../shared/types";
+import { loadPreferences, savePreferences, type StorageLike } from "../shared/storage";
+import type { ChipData, Job, JobDetail, Preferences, Run, Workflow } from "../shared/types";
 import {
   applyTheme,
   badgeEl,
@@ -43,22 +28,15 @@ import {
   mountEmpty,
   mountList,
   mountMenu,
-  mountSearchField,
-  mountSelect,
   mountTabs,
-  mountTextField,
   openUrl,
   providerNotice,
   spinnerHolder,
 } from "../shared/ui";
-import {
-  detectBranch,
-  detectRepo,
-  linkProject,
-  resolveWorkspace,
-  type Workspace,
-} from "../shared/workspace";
+import { resolveWorkspace, type Workspace } from "../shared/workspace";
 import { jobUrl, runUrl, workflowUrl } from "../shared/slug";
+import { createProjectPicker } from "./picker";
+import { createTriggerForm } from "./trigger";
 
 /**
  * The rail panel.
@@ -95,14 +73,6 @@ interface RunsView {
 
 let runsView: RunsView | null = null;
 
-interface TriggerState {
-  loading: boolean;
-  pipelineId: string;
-  branch: string;
-  error: string | null;
-  running: boolean;
-}
-
 interface PanelState {
   ready: HostReadyContext | null;
   connected: boolean;
@@ -123,19 +93,12 @@ interface PanelState {
   jobOutput: string | null;
   /** Why the open workflow's jobs are missing, when CircleCI refused the read. */
   jobsError: string | null;
-  pipelines: PipelineDefinition[];
   preferences: Preferences;
   loading: boolean;
   error: string | null;
   toast: string | null;
   /** What the last Disconnect attempt reported, and where the token really lives. */
   disconnectNotice: string | null;
-  trigger: TriggerState | null;
-  picker: boolean;
-  pickerLoading: boolean;
-  pickerError: string | null;
-  pickerProjects: Project[];
-  pickerFilter: string;
 }
 
 const state: PanelState = {
@@ -157,18 +120,11 @@ const state: PanelState = {
   jobDetail: null,
   jobOutput: null,
   jobsError: null,
-  pipelines: [],
   preferences: { autoRefresh: true },
   loading: true,
   error: null,
   toast: null,
   disconnectNotice: null,
-  trigger: null,
-  picker: false,
-  pickerLoading: false,
-  pickerError: null,
-  pickerProjects: [],
-  pickerFilter: "",
 };
 
 /** A newer load always wins, so a slow answer never paints over a newer one. */
@@ -177,6 +133,49 @@ let renderToken = 0;
 function activeWorkspace(): Workspace | null {
   return state.override ?? state.workspace;
 }
+
+/**
+ * The trigger form and the project picker own their own state. The panel gives
+ * them the project, the file reader and a repaint; they hand back a started run
+ * or a chosen project. Splitting them keeps a form or picker change away from
+ * the run drill-down.
+ */
+const picker = createProjectPicker({
+  client,
+  storage,
+  readProjectFile,
+  directory: () => state.directory,
+  notify,
+  repaint: render,
+  canCancel: () => Boolean(state.workspace),
+  onCancel: async () => {
+    state.override = null;
+    render();
+    await loadRuns({ more: false });
+  },
+  onPicked: async (workspace) => {
+    state.workspace = workspace;
+    state.override = null;
+    state.selectedRun = null;
+    trigger.reset();
+    render();
+    await loadRuns({ more: false });
+  },
+  onDisconnected: () => {
+    state.connected = false;
+  },
+});
+
+const trigger = createTriggerForm({
+  client,
+  storage,
+  readProjectFile,
+  directory: () => state.directory,
+  workspace: activeWorkspace,
+  notify,
+  repaint: render,
+  onStarted: () => loadRuns({ more: false }),
+});
 
 /* ------------------------------------------------------------------- data */
 
@@ -210,9 +209,8 @@ async function boot(): Promise<void> {
     state.workspace = workspace;
     if (!workspace) {
       state.loading = false;
-      state.picker = true;
       render();
-      void openPicker();
+      void picker.open();
       return;
     }
     await loadRuns();
@@ -290,6 +288,9 @@ async function loadJobs(): Promise<void> {
   } catch (error) {
     if (token !== renderToken) return;
     state.loading = false;
+    // The previous list is no longer what the error describes; drop it so the
+    // chip cannot mix stale jobs with a "Job listing unavailable" line.
+    state.jobs = [];
     state.jobsError = describeError(error);
     state.error = state.jobsError;
   }
@@ -469,7 +470,7 @@ async function rerunAll(fromFailed: boolean): Promise<void> {
   const targets = fromFailed
     ? state.workflows.filter((workflow) => isFailure(workflow.outcome))
     : state.workflows;
-  const result = await requestReruns(client, targets, { fromFailed }, notify);
+  const result = await requestRerunBatch(client, targets, { fromFailed }, notify);
   if (result.started > 0) await loadWorkflows();
 }
 
@@ -477,89 +478,12 @@ async function cancel(workflow: Workflow): Promise<void> {
   if (await requestCancel(client, workflow, notify)) await loadJobs();
 }
 
-async function decideApproval(job: Job, approve: boolean): Promise<void> {
-  const done = approve
-    ? await requestApprove(client, job, notify)
-    : await requestReject(client, job, notify);
-  if (done) await loadJobs();
+async function approveHold(job: Job): Promise<void> {
+  if (await requestApprove(client, job, notify)) await loadJobs();
 }
 
-async function loadPipelines(workspace: Workspace): Promise<PipelineDefinition[]> {
-  // Never carry another project's list: reset to this project's cache first,
-  // so a failed refresh cannot leave the trigger form seeding a stale id.
-  const cached = await loadPipelineCache(storage, workspace.link.projectId);
-  state.pipelines = cached ?? [];
-  try {
-    const definitions = await client.listPipelines(workspace.link.projectId);
-    state.pipelines = definitions;
-    await savePipelineCache(storage, workspace.link.projectId, definitions);
-    return definitions;
-  } catch {
-    return state.pipelines;
-  }
-}
-
-async function openTrigger(): Promise<void> {
-  const workspace = activeWorkspace();
-  if (!workspace) return;
-  const branch = state.directory ? await detectBranch(readProjectFile) : null;
-  state.pipelines = [];
-  state.trigger = {
-    loading: true,
-    pipelineId: "",
-    branch: branch ?? "",
-    error: null,
-    running: false,
-  };
-  render();
-  await loadPipelines(workspace);
-  if (!state.trigger) return;
-  state.trigger = {
-    ...state.trigger,
-    loading: false,
-    pipelineId: state.trigger.pipelineId || state.pipelines[0]?.id || "",
-  };
-  render();
-}
-
-async function submitTrigger(): Promise<void> {
-  const workspace = activeWorkspace();
-  const trigger = state.trigger;
-  if (!workspace || !trigger) return;
-  const selected = state.pipelines.some((pipeline) => pipeline.id === trigger.pipelineId)
-    ? trigger.pipelineId
-    : (state.pipelines[0]?.id ?? "");
-  const pipelineId = selected;
-  if (!pipelineId) {
-    state.trigger = { ...trigger, error: "This project has no pipeline to run." };
-    render();
-    return;
-  }
-  const branch = trigger.branch.trim();
-  if (!branch) {
-    state.trigger = { ...trigger, error: "Name a branch or tag to build." };
-    render();
-    return;
-  }
-  state.trigger = { ...trigger, running: true, error: null };
-  render();
-  try {
-    await client.fireRun({
-      projectId: workspace.link.projectId,
-      pipelineId,
-      branch,
-    });
-    state.trigger = null;
-    await notify("success", `Started a run on ${branch}.`);
-    await loadRuns({ more: false });
-  } catch (error) {
-    state.trigger = {
-      ...trigger,
-      running: false,
-      error: describeError(error),
-    };
-    render();
-  }
+async function rejectHold(job: Job): Promise<void> {
+  if (await requestReject(client, job, notify)) await loadJobs();
 }
 
 async function onMenu(id: string): Promise<void> {
@@ -568,13 +492,11 @@ async function onMenu(id: string): Promise<void> {
       await refreshCurrent();
       return;
     case "trigger":
-      await openTrigger();
+      await trigger.open();
       return;
     case "choose":
       state.override = null;
-      state.picker = true;
-      render();
-      await openPicker();
+      await picker.open();
       return;
     case "revert":
       state.override = null;
@@ -585,7 +507,7 @@ async function onMenu(id: string): Promise<void> {
       state.selectedJob = null;
       state.jobDetail = null;
       state.jobOutput = null;
-      state.pipelines = [];
+      trigger.reset();
       render();
       await loadRuns({ more: false });
       return;
@@ -602,50 +524,6 @@ async function onMenu(id: string): Promise<void> {
       return;
     default:
       return;
-  }
-}
-
-async function openPicker(): Promise<void> {
-  state.pickerLoading = true;
-  state.pickerError = null;
-  render();
-  try {
-    const orgs = await client.listOrgs();
-    const results = await Promise.allSettled(orgs.map((org) => client.listProjectsOfOrg(org.id)));
-    const projects: Project[] = [];
-    for (const result of results) {
-      if (result.status === "fulfilled") projects.push(...result.value.items);
-    }
-    projects.sort((left, right) => {
-      const byOrg = left.orgName.localeCompare(right.orgName);
-      return byOrg !== 0 ? byOrg : left.name.localeCompare(right.name);
-    });
-    state.pickerProjects = projects;
-  } catch (error) {
-    state.pickerError = describeError(error);
-    if (isDisconnected(error)) state.connected = false;
-  }
-  state.pickerLoading = false;
-  render();
-}
-
-async function pick(project: Project): Promise<void> {
-  const directory = state.directory;
-  if (!directory) return;
-  try {
-    const repo = await detectRepo(readProjectFile);
-    const workspace = await linkProject(storage, directory, project, repo);
-    state.workspace = workspace;
-    state.override = null;
-    state.picker = false;
-    state.pickerProjects = [];
-    state.pickerFilter = "";
-    state.selectedRun = null;
-    state.pipelines = [];
-    render();
-    await loadRuns({ more: false });
-  } catch (error) {
-    await notify("error", describeError(error));
   }
 }
 
@@ -688,16 +566,16 @@ function render(): void {
     renderNoProject();
     return;
   }
-  if (state.picker) {
-    renderPicker();
+  if (picker.isOpen()) {
+    picker.render(root as HTMLElement);
     return;
   }
   if (!activeWorkspace()) {
     renderNoProject();
     return;
   }
-  if (state.trigger) {
-    renderTrigger();
+  if (trigger.isOpen()) {
+    trigger.render(root as HTMLElement);
     return;
   }
   if (state.selectedJob) {
@@ -728,100 +606,6 @@ function renderConnect(): void {
   });
 }
 
-function renderTrigger(): void {
-  const trigger = state.trigger;
-  if (!trigger) return renderRuns();
-  const head = el("div", { className: "detail-head" });
-  const top = el("div", { className: "row" });
-  const back = el("div");
-  mountButton(back, {
-    label: "← Runs",
-    variant: "ghost",
-    size: "sm",
-    onClick: () => {
-      state.trigger = null;
-      render();
-    },
-  });
-  top.append(back);
-  top.append(el("span", { className: "spacer" }));
-  head.append(top);
-  head.append(el("div", { className: "detail-title" }, "Run a pipeline"));
-  head.append(
-    el(
-      "div",
-      { className: "detail-sub" },
-      "Fire a new run on a branch or tag. The pipeline definition picks which config to build.",
-    ),
-  );
-  root?.append(head);
-
-  if (trigger.loading) {
-    root?.append(spinnerHolder("Loading pipelines"));
-    return;
-  }
-
-  const body = el("div", { className: "section" });
-  if (state.pipelines.length > 1) {
-    const holder = el("div");
-    let pipelineSelect: ReturnType<typeof mountSelect> | null = null;
-    pipelineSelect = mountSelect(holder, {
-      label: "Pipeline",
-      value: trigger.pipelineId,
-      options: state.pipelines.map((pipeline) => ({
-        id: pipeline.id,
-        label: pipeline.name,
-        hint: pipeline.configPath,
-      })),
-      onChange: (id) => {
-        if (!state.trigger) return;
-        state.trigger = { ...state.trigger, pipelineId: id };
-        pipelineSelect?.update({ value: id });
-      },
-    });
-    body.append(holder);
-  } else if (state.pipelines.length === 1) {
-    body.append(el("p", { className: "notice" }, `Pipeline: ${state.pipelines[0]?.name ?? ""}`));
-  } else {
-    body.append(
-      el(
-        "p",
-        { className: "notice error-text" },
-        "This project lists no pipeline definition to run.",
-      ),
-    );
-  }
-
-  const branchHolder = el("div");
-  let branchField: ReturnType<typeof mountTextField> | null = null;
-  branchField = mountTextField(branchHolder, {
-    label: "Branch or tag",
-    value: trigger.branch,
-    placeholder: "main",
-    mono: true,
-    onChange: (value) => {
-      if (!state.trigger) return;
-      state.trigger = { ...state.trigger, branch: value, error: null };
-      branchField?.update({ value });
-    },
-  });
-  body.append(branchHolder);
-
-  if (trigger.error) body.append(el("p", { className: "notice error-text" }, trigger.error));
-
-  const actions = el("div", { className: "detail-actions" });
-  const runHolder = el("div");
-  mountButton(runHolder, {
-    label: "Start run",
-    loading: trigger.running,
-    disabled: trigger.running || state.pipelines.length === 0,
-    onClick: () => void submitTrigger(),
-  });
-  actions.append(runHolder);
-  body.append(actions);
-  root?.append(body);
-}
-
 function renderNoProject(): void {
   const holder = el("div");
   root?.append(holder);
@@ -829,104 +613,6 @@ function renderNoProject(): void {
     title: "No project open",
     body: "Open a project in OpenChamber. This extension maps that project to a CircleCI project the first time it runs.",
   });
-}
-
-function renderPicker(): void {
-  const head = el("div", { className: "detail-head" });
-  const title = el("div", { className: "detail-title" }, "Choose a CircleCI project");
-  head.append(title);
-  head.append(
-    el(
-      "div",
-      { className: "detail-sub" },
-      "This extension remembers the choice per OpenChamber project.",
-    ),
-  );
-  if (state.workspace) {
-    const back = el("div");
-    mountButton(back, {
-      label: "Back",
-      variant: "ghost",
-      size: "sm",
-      onClick: () => {
-        state.picker = false;
-        state.override = null;
-        render();
-        void loadRuns({ more: false });
-      },
-    });
-    head.append(back);
-  }
-  root?.append(head);
-
-  if (state.pickerError) {
-    const holder = el("div");
-    root?.append(holder);
-    mountBanner(holder, {
-      tone: "error",
-      title: "CircleCI",
-      body: state.pickerError,
-      action: { label: "Retry", onClick: () => void openPicker() },
-    });
-  }
-
-  if (state.pickerLoading) {
-    root?.append(spinnerHolder("Loading projects"));
-    return;
-  }
-
-  if (state.pickerProjects.length === 0) {
-    if (state.pickerError) return;
-    const holder = el("div");
-    root?.append(holder);
-    mountEmpty(holder, {
-      title: "No projects",
-      body: "This token is not a member of any CircleCI organization with projects, or the token cannot list them.",
-    });
-    return;
-  }
-
-  const searchHolder = el("div");
-  root?.append(searchHolder);
-  const listHolder = el("div", { className: "scroll" });
-  root?.append(listHolder);
-
-  const items = () => pickerItems();
-  const list = mountList(listHolder, {
-    items: items(),
-    ariaLabel: "CircleCI projects",
-    onSelect: (id) => {
-      const project = state.pickerProjects.find((entry) => entry.id === id);
-      if (project) void pick(project);
-    },
-  });
-  // The kit never commits a typed or cleared value: it reports the change and
-  // waits for `update({ value })`, so Escape and the clear button need it too.
-  let search: ReturnType<typeof mountSearchField> | null = null;
-  search = mountSearchField(searchHolder, {
-    value: state.pickerFilter,
-    label: "Filter projects",
-    placeholder: "Filter by organization or repository",
-    onChange: (value) => {
-      state.pickerFilter = value;
-      search?.update({ value });
-      list.update({ items: items() });
-    },
-  });
-}
-
-function pickerItems(): Array<{ id: string; leading: string; title: string; subtitle?: string }> {
-  const needle = state.pickerFilter.trim().toLowerCase();
-  return state.pickerProjects
-    .filter((project) => {
-      if (!needle) return true;
-      return `${project.orgName}/${project.name}`.toLowerCase().includes(needle);
-    })
-    .map((project) => ({
-      id: project.id,
-      leading: project.orgName ? `${project.orgName}/` : "",
-      title: project.name,
-    }));
 }
 
 function renderToolbar(): { bar: HTMLElement; tabs: ReturnType<typeof mountTabs> } {
@@ -1033,11 +719,8 @@ function forgetAccountData(): void {
   state.selectedJob = null;
   state.jobDetail = null;
   state.jobOutput = null;
-  state.pipelines = [];
-  state.trigger = null;
-  state.picker = false;
-  state.pickerProjects = [];
-  state.pickerFilter = "";
+  trigger.reset();
+  picker.reset();
   state.toast = null;
   state.error = null;
   state.disconnectNotice = null;
@@ -1371,12 +1054,12 @@ function renderJobs(): void {
     if (isApproval && status.active) {
       actions.push({
         label: "Approve",
-        onClick: () => void decideApproval(job, true),
+        onClick: () => void approveHold(job),
         variant: "default",
       });
       actions.push({
         label: "Reject",
-        onClick: () => void decideApproval(job, false),
+        onClick: () => void rejectHold(job),
         variant: "ghost",
       });
     }
@@ -1588,7 +1271,7 @@ host.onItem((item) => {
 async function openFromChip(data: ChipData): Promise<void> {
   const workspace = activeWorkspace();
   if (workspace && workspace.link.projectId !== data.projectId) {
-    state.pipelines = [];
+    trigger.reset();
     state.override = {
       directory: state.directory ?? "",
       repo: null,

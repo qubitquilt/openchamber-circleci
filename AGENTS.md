@@ -18,7 +18,7 @@ src/shared/     code every surface shares: the API client (`client.ts`), the wir
                 (`storage.ts`), project resolution (`workspace.ts`), chip builders (`chips.ts`), the
                 chip host calls (`actions.ts`), the stylesheet (`styles.ts`), the DOM helper (`dom.ts`),
                 error text (`errors.ts`) and the host client (`host.ts`)
-src/panel/      the rail panel        -> panel/main.js
+src/panel/      the rail panel, plus its project picker (`picker.ts`) and trigger form (`trigger.ts`) -> panel/main.js
 src/page/       the full-screen page  -> panel/page.js
 src/attach/     the + picker          -> panel/attach.js
 src/background/ the resolver frame    -> background/main.js
