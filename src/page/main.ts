@@ -11,8 +11,9 @@ import { createPoller } from "../shared/poll";
 import { anyActive, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import {
+  approveJob as requestApprove,
   cancelWorkflow as requestCancel,
-  decideApproval as requestApproval,
+  rejectJob as requestReject,
   rerunWorkflow as requestRerun,
 } from "../shared/workflow-actions";
 import { loadPreferences, savePreferences, type StorageLike } from "../shared/storage";
@@ -232,6 +233,7 @@ function sourceFor(options: {
     workflow,
     job: options.job ?? null,
     jobs: options.jobs ?? (workflow ? (state.jobs[workflow.id] ?? []) : []),
+    jobsError: workflow ? (state.jobErrors[workflow.id] ?? null) : null,
     detail: null,
     output: null,
   };
@@ -258,7 +260,7 @@ async function startSession(source: ChipSource | null): Promise<void> {
 }
 
 async function rerun(workflow: Workflow, fromFailed: boolean): Promise<void> {
-  if (await requestRerun(client, workflow, fromFailed, notify)) await refreshDetail();
+  if (await requestRerun(client, workflow, { fromFailed }, notify)) await refreshDetail();
 }
 
 async function cancel(workflow: Workflow): Promise<void> {
@@ -266,7 +268,10 @@ async function cancel(workflow: Workflow): Promise<void> {
 }
 
 async function decideApproval(job: Job, approve: boolean): Promise<void> {
-  if (await requestApproval(client, job, approve, notify)) await refreshDetail();
+  const done = approve
+    ? await requestApprove(client, job, notify)
+    : await requestReject(client, job, notify);
+  if (done) await refreshDetail();
 }
 
 /* ----------------------------------------------------------------- polling */

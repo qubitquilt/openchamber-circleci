@@ -280,6 +280,16 @@ function clickByText(doc, text) {
   return node;
 }
 
+/** A button whose whole label is `text`, for cases where `includes` is too loose. */
+function clickExact(doc, text) {
+  const node = [...doc.querySelectorAll("button")].find(
+    (entry) => (entry.textContent ?? "").trim() === text,
+  );
+  if (!node) throw new Error(`no button labelled ${JSON.stringify(text)}`);
+  node.click();
+  return node;
+}
+
 test("the panel drills run -> workflow -> job and attaches the failure with its output", async () => {
   const surface = await boot({
     html: "panel/index.html",
@@ -875,7 +885,7 @@ test("switching project cannot seed the trigger from the previous project's pipe
 
 /* ------------------------------------------------------- failed job listings */
 
-const jobsFail = () =>
+const jobsServerError = () =>
   json(500, { error: { type: "server_error", detail: "the job log store is unavailable" } });
 
 test("the page says a workflow's jobs could not be read instead of showing none", async () => {
@@ -883,7 +893,7 @@ test("the page says a workflow's jobs could not be read instead of showing none"
     html: "panel/page.html",
     script: "panel/page.js",
     surface: "page",
-    answers: routes({ "GET /api/v3/jobs": jobsFail }),
+    answers: routes({ "GET /api/v3/jobs": jobsServerError }),
     files: gitFiles,
   });
   try {
@@ -900,12 +910,51 @@ test("the picker says a workflow's jobs could not be read instead of looking emp
     html: "panel/attach.html",
     script: "panel/attach.js",
     surface: "dialog",
-    answers: routes({ "GET /api/v3/jobs": jobsFail }),
+    answers: routes({ "GET /api/v3/jobs": jobsServerError }),
     files: gitFiles,
   });
   try {
     assert.match(surface.text(), /Could not list this workflow's jobs/);
     assert.match(surface.text(), /job log store is unavailable/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the picker's chip carries the failed job read to the agent", async () => {
+  const surface = await boot({
+    html: "panel/attach.html",
+    script: "panel/attach.js",
+    surface: "dialog",
+    answers: routes({ "GET /api/v3/jobs": jobsServerError }),
+    files: gitFiles,
+  });
+  try {
+    clickExact(surface.doc, "Attach");
+    await surface.settle();
+    const attach = surface.calls.find((entry) => entry.type === "attach");
+    assert.ok(attach, "a chip was attached");
+    assert.match(attach.payload.text, /Job listing unavailable/);
+    assert.match(attach.payload.text, /job log store is unavailable/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the page's chip carries the failed job read to the agent", async () => {
+  const surface = await boot({
+    html: "panel/page.html",
+    script: "panel/page.js",
+    surface: "page",
+    answers: routes({ "GET /api/v3/jobs": jobsServerError }),
+    files: gitFiles,
+  });
+  try {
+    clickExact(surface.doc, "Attach");
+    await surface.settle();
+    const attach = surface.calls.find((entry) => entry.type === "attach");
+    assert.ok(attach, "a chip was attached");
+    assert.match(attach.payload.text, /Job listing unavailable/);
   } finally {
     surface.dispose();
   }

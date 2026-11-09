@@ -30,6 +30,12 @@ export interface ChipSource {
   job: Job | null;
   /** The selected workflow's jobs, when the surface has loaded them. */
   jobs: Job[];
+  /**
+   * Why the workflow's jobs could not be read, when CircleCI refused.
+   * A failed read is not the same as a workflow with no jobs, so the chip
+   * carries it instead of looking like an empty workflow.
+   */
+  jobsError: string | null;
   detail: JobDetail | null;
   /** Condensed stdout of the failing step, when one was fetched. */
   output: string | null;
@@ -45,6 +51,11 @@ function clamp(text: string, limit: number): string {
 
 function statusWords(value: { phase: string; outcome: string | null }): string {
   return statusOf(value.phase, value.outcome).label.toLowerCase();
+}
+
+/** `org/project`, or just the project when the API gave no organization name. */
+function qualifiedName(orgName: string, projectName: string): string {
+  return orgName ? `${orgName}/${projectName}` : projectName;
 }
 
 /**
@@ -129,10 +140,10 @@ export function chipUrl(source: ChipSource): string {
 }
 
 export function chipText(source: ChipSource): string {
-  const { workspace, run, workflow, job, jobs, detail, output } = source;
+  const { workspace, run, workflow, job, jobs, jobsError, detail, output } = source;
   const lines: string[] = [];
   lines.push(
-    `CircleCI run #${run.number} on ${workspace.link.orgName}/${workspace.link.projectName}`,
+    `CircleCI run #${run.number} on ${qualifiedName(workspace.link.orgName, workspace.link.projectName)}`,
   );
   lines.push(`Status: ${statusWords({ phase: run.phase, outcome: run.outcome })}`);
   if (run.pipelineName) lines.push(`Pipeline: ${run.pipelineName}`);
@@ -144,6 +155,7 @@ export function chipText(source: ChipSource): string {
   if (workflow) {
     lines.push("");
     lines.push(`Workflow ${workflow.name} (${statusWords(workflow)})`);
+    if (jobsError) lines.push(`Job listing unavailable: ${jobsError}`);
     if (failing.length > 0) {
       lines.push("Failing jobs:");
       for (const entry of failing) lines.push(`- ${entry.name} (#${entry.number})`);

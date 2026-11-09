@@ -94,6 +94,7 @@ host.onResolve(async ({ command, args }) => {
     workflow: null,
     job: null,
     jobs: [],
+    jobsError: null,
     detail: null,
     output: null,
   });

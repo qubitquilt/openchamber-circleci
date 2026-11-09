@@ -104,6 +104,7 @@ function source(overrides = {}) {
     workflow,
     job: failingJob,
     jobs: [failingJob, passingJob],
+    jobsError: null,
     detail,
     output: "FAIL src/login.test.ts",
     ...overrides,
@@ -218,14 +219,45 @@ test("the chip reader refuses anything that is not its own payload", () => {
 });
 
 test("a chip for a project with no organization name still reopens", () => {
-  const bare = {
+  const blankOrgWorkspace = {
     ...workspace,
     link: { ...workspace.link, orgName: "" },
   };
-  const json = chipDataJson(source({ workspace: bare }));
+  const json = chipDataJson(source({ workspace: blankOrgWorkspace }));
   assert.equal(json.orgName, "");
   const data = readChipData(json);
   assert.ok(data, "the chip is accepted");
   assert.equal(data.orgName, "");
   assert.equal(data.runId, "run-1");
+});
+
+test("a blank org name drops the separator from the chip text", () => {
+  const blankOrgWorkspace = { ...workspace, link: { ...workspace.link, orgName: "" } };
+  const text = chipText(source({ workspace: blankOrgWorkspace }));
+  assert.match(text, /CircleCI run #12 on web/);
+  assert.doesNotMatch(text, /on \//);
+});
+
+test("a missing or non-string org name normalizes to blank, not a refusal", () => {
+  const base = chipDataJson(source());
+  for (const orgName of [undefined, null, 42, {}, []]) {
+    const data = readChipData({ ...base, orgName });
+    assert.ok(data, `accepted with orgName ${JSON.stringify(orgName)}`);
+    assert.equal(data.orgName, "");
+  }
+});
+
+test("a chip built after a failed job read carries the reason", () => {
+  const text = chipText(
+    source({
+      job: null,
+      detail: null,
+      output: null,
+      jobs: [],
+      jobsError: "the job log store is unavailable",
+    }),
+  );
+  assert.match(text, /Workflow build-and-test/);
+  assert.match(text, /Job listing unavailable: the job log store is unavailable/);
+  assert.doesNotMatch(text, /Failing jobs/);
 });

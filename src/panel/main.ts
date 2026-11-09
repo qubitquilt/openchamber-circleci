@@ -11,9 +11,11 @@ import { createPoller } from "../shared/poll";
 import { anyActive, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import {
+  approveJob as requestApprove,
   cancelWorkflow as requestCancel,
-  decideApproval as requestApproval,
+  rejectJob as requestReject,
   rerunWorkflow as requestRerun,
+  rerunWorkflows as requestReruns,
 } from "../shared/workflow-actions";
 import {
   loadPipelineCache,
@@ -119,6 +121,8 @@ interface PanelState {
   selectedJob: Job | null;
   jobDetail: JobDetail | null;
   jobOutput: string | null;
+  /** Why the open workflow's jobs are missing, when CircleCI refused the read. */
+  jobsError: string | null;
   pipelines: PipelineDefinition[];
   preferences: Preferences;
   loading: boolean;
@@ -152,6 +156,7 @@ const state: PanelState = {
   selectedJob: null,
   jobDetail: null,
   jobOutput: null,
+  jobsError: null,
   pipelines: [],
   preferences: { autoRefresh: true },
   loading: true,
@@ -280,11 +285,13 @@ async function loadJobs(): Promise<void> {
     const page = await client.listJobs(workflow.id);
     if (token !== renderToken) return;
     state.jobs = page.items;
+    state.jobsError = null;
     state.loading = false;
   } catch (error) {
     if (token !== renderToken) return;
     state.loading = false;
-    state.error = describeError(error);
+    state.jobsError = describeError(error);
+    state.error = state.jobsError;
   }
   render();
   schedulePoll();
@@ -347,6 +354,7 @@ async function openRun(run: Run): Promise<void> {
 async function openWorkflow(workflow: Workflow): Promise<void> {
   state.selectedWorkflow = workflow;
   state.jobs = [];
+  state.jobsError = null;
   state.selectedJob = null;
   state.jobDetail = null;
   state.jobOutput = null;
@@ -410,6 +418,7 @@ function sourceFor(options: {
     workflow: options.workflow ?? state.selectedWorkflow,
     job: options.job ?? state.selectedJob,
     jobs: state.jobs,
+    jobsError: state.jobsError,
     detail: options.detail ?? state.jobDetail,
     output: options.output ?? state.jobOutput,
   };
@@ -448,32 +457,20 @@ async function promptFix(source: ChipSource | null): Promise<void> {
 /* ----------------------------------------------------------------- actions */
 
 async function rerun(workflow: Workflow, fromFailed: boolean): Promise<void> {
-  if (await requestRerun(client, workflow, fromFailed, notify)) await loadJobs();
+  if (await requestRerun(client, workflow, { fromFailed }, notify)) await loadJobs();
 }
 
 /**
  * Rerun every workflow of the open run. CircleCI reruns a workflow, not a run,
- * so this loops: only failed ones for "from failed", every one otherwise.
+ * so the shared batch helper loops: only failed ones for "from failed", every
+ * one otherwise, with one aggregate report.
  */
 async function rerunAll(fromFailed: boolean): Promise<void> {
   const targets = fromFailed
     ? state.workflows.filter((workflow) => isFailure(workflow.outcome))
     : state.workflows;
-  if (targets.length === 0) {
-    await notify("info", "No failed workflow to rerun.");
-    return;
-  }
-  let started = 0;
-  for (const workflow of targets) {
-    try {
-      await client.rerunWorkflow(workflow.id, fromFailed);
-      started += 1;
-    } catch (error) {
-      await notify("error", describeError(error));
-    }
-  }
-  if (started > 0) await notify("success", `Started ${started} rerun${started === 1 ? "" : "s"}.`);
-  await loadWorkflows();
+  const result = await requestReruns(client, targets, { fromFailed }, notify);
+  if (result.started > 0) await loadWorkflows();
 }
 
 async function cancel(workflow: Workflow): Promise<void> {
@@ -481,7 +478,10 @@ async function cancel(workflow: Workflow): Promise<void> {
 }
 
 async function decideApproval(job: Job, approve: boolean): Promise<void> {
-  if (await requestApproval(client, job, approve, notify)) await loadJobs();
+  const done = approve
+    ? await requestApprove(client, job, notify)
+    : await requestReject(client, job, notify);
+  if (done) await loadJobs();
 }
 
 async function loadPipelines(workspace: Workspace): Promise<PipelineDefinition[]> {

@@ -201,8 +201,9 @@ function source(): ChipSource | null {
   const workflow = state.workflows.find((entry) => entry.id === state.selectedWorkflowId) ?? null;
   if (!workspace || !run) return null;
   const jobs = workflow ? (state.jobs[workflow.id] ?? []) : [];
+  const jobsError = workflow ? (state.jobErrors[workflow.id] ?? null) : null;
   const job = workflow ? (jobs.find((entry) => isFailure(entry.outcome)) ?? null) : null;
-  return { workspace, run, workflow, job, jobs, detail: null, output: null };
+  return { workspace, run, workflow, job, jobs, jobsError, detail: null, output: null };
 }
 
 async function attach(): Promise<void> {
