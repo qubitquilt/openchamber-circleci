@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { currentWork, prNumberFromLink } from "../build/current-work.mjs";
+import { detectCurrentWork as currentWork, prNumberFromLink } from "../build/current-work.mjs";
 
 /** A file reader over a fixed table; missing paths fail like the host does. */
 function readFileOf(files) {
@@ -52,7 +52,7 @@ test("a normal checkout answers from .git/HEAD", async () => {
     readFile: readFileOf({ ".git/HEAD": "ref: refs/heads/fix-login\n" }),
     host: hostOf({ projects: [{ id: "p-1", directory: "/repo" }] }),
   });
-  assert.deepEqual(work, { branch: "fix-login", via: "head", prNumbers: [] });
+  assert.deepEqual(work, { branch: "fix-login", branchSource: "head", prNumbers: [] });
 });
 
 test("a worktree answers from the host's worktree list, under its project or a descendant", async () => {
@@ -71,7 +71,11 @@ test("a worktree answers from the host's worktree list, under its project or a d
         },
       }),
     });
-    assert.deepEqual(work, { branch: "fix-login", via: "worktree", prNumbers: [] }, directory);
+    assert.deepEqual(
+      work,
+      { branch: "fix-login", branchSource: "worktree", prNumbers: [] },
+      directory,
+    );
   }
 });
 
@@ -103,7 +107,7 @@ test("PR numbers come from this session's links of kind change, in order", async
       },
     }),
   });
-  assert.deepEqual(work, { branch: "main", via: "head", prNumbers: [31, 9, 7] });
+  assert.deepEqual(work, { branch: "main", branchSource: "head", prNumbers: [31, 9, 7] });
 });
 
 test("a worktree outside its project's directory still finds its project", async () => {
@@ -128,7 +132,7 @@ test("a worktree outside its project's directory still finds its project", async
     }),
   });
   // The branch and the PR lookup both come from the discovered project.
-  assert.deepEqual(work, { branch: "fix", via: "worktree", prNumbers: [31] });
+  assert.deepEqual(work, { branch: "fix", branchSource: "worktree", prNumbers: [31] });
 });
 
 test("a link URL is picked apart by provider", () => {
@@ -186,6 +190,7 @@ test("a PR lookup failing keeps the branch-only scope", async () => {
       worktrees: [],
     }),
     listSessions: async () => {
+      calls.push("sessions");
       throw new Error("NOT_GRANTED");
     },
   };
@@ -195,6 +200,26 @@ test("a PR lookup failing keeps the branch-only scope", async () => {
     readFile: readFileOf({ ".git/HEAD": "ref: refs/heads/main\n" }),
     host,
   });
-  assert.deepEqual(work, { branch: "main", via: "head", prNumbers: [] });
-  assert.deepEqual(calls, ["projects"]);
+  assert.deepEqual(work, { branch: "main", branchSource: "head", prNumbers: [] });
+  // The failed lookup was attempted, not skipped: only its result is absent.
+  assert.deepEqual(calls, ["projects", "sessions"]);
+});
+
+test("an external detached worktree still finds its project's session pull requests", async () => {
+  const work = await currentWork({
+    directory: "/worktrees/detached",
+    session: { id: "s-1" },
+    readFile: readFileOf({}),
+    host: hostOf({
+      projects: [{ id: "p-1", directory: "/repo" }],
+      worktrees: { "p-1": [{ directory: "/worktrees/detached", branch: "" }] },
+      sessions: {
+        "p-1": [
+          { id: "s-1", links: [{ url: "https://github.com/acme/web/pull/31", kind: "change" }] },
+        ],
+      },
+    }),
+  });
+  // No branch, but the project owns the directory and supplies PR scope.
+  assert.deepEqual(work, { branch: null, branchSource: null, prNumbers: [31] });
 });

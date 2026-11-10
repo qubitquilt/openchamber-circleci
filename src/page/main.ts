@@ -274,10 +274,10 @@ async function toggleScope(): Promise<void> {
 }
 
 /** The scope toggle: filled while scoped, outline while not. */
-function scopePill(): HTMLElement {
+function scopePill(work: CurrentWork): HTMLElement {
   const holder = el("div");
   mountButton(holder, {
-    label: scopeLabel(state.currentWork),
+    label: scopeLabel(work),
     size: "sm",
     variant: state.scopeOn ? "default" : "outline",
     onClick: () => void toggleScope(),
@@ -494,7 +494,7 @@ function renderRunColumn(): HTMLElement {
   filterRow.append(searchHolder);
   if (state.currentWork) {
     const scopeHolder = el("div");
-    scopeHolder.append(scopePill());
+    scopeHolder.append(scopePill(state.currentWork));
     filterRow.append(scopeHolder);
   }
   column.append(filterRow);

@@ -26,7 +26,7 @@ import type { ReadProjectFile } from "./workspace";
 export interface CurrentWork {
   branch: string | null;
   /** How `branch` was learned: `.git/HEAD` or the host's worktree list. */
-  via: "head" | "worktree" | null;
+  branchSource: "head" | "worktree" | null;
   /** PR numbers linked to the current session, in link order. */
   prNumbers: number[];
 }
@@ -83,41 +83,42 @@ function projectForDirectory(
   return projects.find((project) => coversDirectory(project.directory, directory))?.id ?? null;
 }
 
-function worktreeBranch(
-  worktrees: Array<{ directory: string; branch: string }>,
-  directory: string,
-): string | null {
-  const match = worktrees.find(
-    (worktree) => worktree.directory === directory && worktree.branch.length > 0,
-  );
-  return match?.branch ?? null;
+interface ProjectWorktree {
+  /** True when the project's worktree list contains this exact directory. */
+  owns: boolean;
+  /** The branch that worktree is on, or null when it is detached. */
+  branch: string | null;
 }
 
-/** The branch `directory` is on in this project's worktree list, or null. */
-async function branchOfProject(
+/** The worktree of `directory` inside one project's worktree list. */
+async function worktreeInProject(
   input: CurrentWorkInput,
   projectId: string,
   directory: string,
-): Promise<string | null> {
+): Promise<ProjectWorktree> {
   try {
-    return worktreeBranch((await input.host.listWorktrees(projectId)).worktrees, directory);
+    const worktrees = (await input.host.listWorktrees(projectId)).worktrees;
+    const match = worktrees.find((worktree) => worktree.directory === directory);
+    if (!match) return { owns: false, branch: null };
+    return { owns: true, branch: match.branch.length > 0 ? match.branch : null };
   } catch {
     // A host without worktree data cannot scope either; the toggle stays hidden.
-    return null;
+    return { owns: false, branch: null };
   }
 }
 
-export async function currentWork(input: CurrentWorkInput): Promise<CurrentWork | null> {
+/** The detection steps. May reject; `detectCurrentWork` is the surface entry point. */
+async function detect(input: CurrentWorkInput): Promise<CurrentWork | null> {
   const directory = input.directory;
   if (!directory) return null;
 
   let branch: string | null = null;
-  let via: CurrentWork["via"] = null;
+  let branchSource: CurrentWork["branchSource"] = null;
 
   try {
     const head = await input.readFile(".git/HEAD");
     branch = branchFromHead(head.content);
-    if (branch) via = "head";
+    if (branch) branchSource = "head";
   } catch {
     // A worktree's `.git` is a file, so `.git/HEAD` is simply absent; the
     // branch comes from the host's worktree list below.
@@ -138,18 +139,21 @@ export async function currentWork(input: CurrentWorkInput): Promise<CurrentWork 
     // A worktree can sit outside its project's registered directory — a
     // sibling, or under a separate worktrees root — where the path no longer
     // spells out the project. The host still knows the relation, so ask each
-    // project's worktree list, starting with the one the path named.
+    // project's worktree list, starting with the one the path named. A
+    // detached worktree owns its directory without naming a branch; the
+    // project still matters, because it holds the session's PR links.
     const ordered = projectId
       ? [projectId, ...projects.filter((project) => project.id !== projectId).map((p) => p.id)]
       : projects.map((project) => project.id);
     for (const candidate of ordered) {
-      const found = await branchOfProject(input, candidate, directory);
-      if (found) {
-        projectId = candidate;
-        branch = found;
-        via = "worktree";
-        break;
+      const found = await worktreeInProject(input, candidate, directory);
+      if (!found.owns) continue;
+      projectId = candidate;
+      if (found.branch) {
+        branch = found.branch;
+        branchSource = "worktree";
       }
+      break;
     }
   }
 
@@ -168,17 +172,17 @@ export async function currentWork(input: CurrentWorkInput): Promise<CurrentWork 
   }
 
   if (!branch && prNumbers.length === 0) return null;
-  return { branch, via, prNumbers };
+  return { branch, branchSource, prNumbers };
 }
 
 /**
- * `currentWork`, with any unexpected failure flattened to "nothing
- * detected". Surfaces call this one entry point, so the degrade rule lives
- * here instead of being copied per surface.
+ * The one detection entry point surfaces use: any unexpected failure is
+ * flattened to "nothing detected", so a half-built scope never reaches a
+ * render.
  */
 export async function detectCurrentWork(input: CurrentWorkInput): Promise<CurrentWork | null> {
   try {
-    return await currentWork(input);
+    return await detect(input);
   } catch {
     return null;
   }
@@ -190,9 +194,9 @@ export function scopeOf(work: CurrentWork | null): RunScope {
   return { branch: work.branch, prNumbers: work.prNumbers };
 }
 
-/** The scope toggle's own words: which of the two detections it is scoping to. */
-export function scopeLabel(work: CurrentWork | null): string {
-  return work?.branch ? "This branch" : "My pull requests";
+/** The scope toggle's own words. Callers render it only with a detection. */
+export function scopeLabel(work: CurrentWork): string {
+  return work.branch ? "This branch" : "My pull requests";
 }
 
 /** One muted line naming what the scope keeps, so the toggle is never ambiguous. */

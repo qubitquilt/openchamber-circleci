@@ -160,6 +160,12 @@ const state: PanelState = {
 /** A newer load always wins, so a slow answer never paints over a newer one. */
 let renderToken = 0;
 
+/**
+ * A resolution's own token. Polling bumps `renderToken` on every tick, so it
+ * must not be able to cancel a pending project/branch resolution.
+ */
+let resolveToken = 0;
+
 function activeWorkspace(): Workspace | null {
   return state.override ?? state.workspace;
 }
@@ -184,6 +190,8 @@ const picker = createProjectPicker({
     await loadRuns({ more: false });
   },
   onPicked: async (workspace) => {
+    // A resolution still in flight belongs to the previous choice.
+    resolveToken += 1;
     forgetProjectData();
     state.workspace = workspace;
     state.currentWork = await detectCurrentWork({
@@ -241,7 +249,7 @@ async function boot(): Promise<void> {
  */
 async function resolveAndLoad(): Promise<void> {
   const directory = state.directory;
-  const token = ++renderToken;
+  const token = ++resolveToken;
   if (!state.connected || !directory) {
     state.loading = false;
     render();
@@ -249,7 +257,7 @@ async function resolveAndLoad(): Promise<void> {
   }
   try {
     const workspace = await resolveWorkspace(client, storage, directory, readProjectFile);
-    if (token !== renderToken) return;
+    if (token !== resolveToken) return;
     state.workspace = workspace;
     if (!workspace) {
       state.loading = false;
@@ -258,19 +266,20 @@ async function resolveAndLoad(): Promise<void> {
       return;
     }
     // A detection for the previous directory may resolve after the switch:
-    // only the token-owning load may write the result, or stale branch/PR data
-    // would scope the new directory's runs.
+    // only the resolution that owns the token may write the result, or stale
+    // branch/PR data would scope the new directory's runs. A poll tick bumps
+    // only `renderToken`, so it cannot cancel this.
     const work = await detectCurrentWork({
       directory: state.directory,
       session: state.ready?.session ?? null,
       readFile: readProjectFile,
       host,
     });
-    if (token !== renderToken) return;
+    if (token !== resolveToken) return;
     state.currentWork = work;
     await loadRuns();
   } catch (error) {
-    if (token !== renderToken) return;
+    if (token !== resolveToken) return;
     state.loading = false;
     state.error = describeError(error);
     if (isDisconnected(error)) state.connected = false;
@@ -775,7 +784,7 @@ function renderToolbar(): { tabs: ReturnType<typeof mountTabs> } {
   filterRow.append(searchHolder);
   if (state.currentWork) {
     const scopeHolder = el("div");
-    scopeHolder.append(scopePill());
+    scopeHolder.append(scopePill(state.currentWork));
     filterRow.append(scopeHolder);
   }
   root?.append(filterRow);
@@ -801,10 +810,10 @@ function renderToolbar(): { tabs: ReturnType<typeof mountTabs> } {
  * The scope toggle. The kit's button has no active look, so the variant
  * carries it: filled while scoped, outline while not.
  */
-function scopePill(): HTMLElement {
+function scopePill(work: CurrentWork): HTMLElement {
   const holder = el("div");
   mountButton(holder, {
-    label: scopeLabel(state.currentWork),
+    label: scopeLabel(work),
     size: "sm",
     variant: state.scopeOn ? "default" : "outline",
     onClick: () => void toggleScope(),
