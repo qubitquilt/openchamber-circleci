@@ -46,6 +46,12 @@ export interface RunError {
   message: string;
 }
 
+/** One pull request a run's event carries, as CircleCI reports it. */
+export interface RunPR {
+  number: number;
+  url: string | null;
+}
+
 export interface RunWarning {
   type: string;
   message: string;
@@ -67,6 +73,8 @@ export interface Run {
   commitUrl: string | null;
   pipelineName: string | null;
   trigger: string | null;
+  /** Pull requests the run's vcs event reports; usually none or one. */
+  pullRequests: RunPR[];
   errors: RunError[];
   warnings: RunWarning[];
 }

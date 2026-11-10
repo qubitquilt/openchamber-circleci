@@ -77,7 +77,9 @@ function withoutScripts(html) {
  * Boot one surface.
  *
  * `answers` maps a route (`GET /api/v3/runs`) to `{status, body}` or a
- * function. `files` maps a path to its text content.
+ * function. `files` maps a path to its text content. `workspace` carries the
+ * host's workspace snapshot data: `projects`, and `worktrees`/`sessions`
+ * keyed by project id.
  */
 export async function boot(options) {
   const {
@@ -90,6 +92,7 @@ export async function boot(options) {
     directory,
     item,
     hostErrors = {},
+    workspace: workspaceData = {},
   } = options;
   const pushed = [];
   const requests = [];
@@ -203,6 +206,44 @@ export async function boot(options) {
         post({ ...envelope, payload: { content: files[path] } });
         return;
       }
+      case "workspace-read": {
+        // The projects snapshot, or the worktrees/sessions of one project id.
+        const query = request.payload ?? {};
+        if (query.kind === "projects") {
+          post({
+            ...envelope,
+            payload: {
+              kind: "projects",
+              state: "ready",
+              projects: workspaceData.projects ?? [],
+            },
+          });
+          return;
+        }
+        if (query.kind === "worktrees") {
+          post({
+            ...envelope,
+            payload: {
+              kind: "worktrees",
+              projectId: query.projectId,
+              state: "ready",
+              worktrees: workspaceData.worktrees?.[query.projectId] ?? [],
+            },
+          });
+          return;
+        }
+        post({
+          ...envelope,
+          payload: {
+            kind: "sessions",
+            projectId: query.projectId,
+            state: "ready",
+            coverage: [],
+            sessions: workspaceData.sessions?.[query.projectId] ?? [],
+          },
+        });
+        return;
+      }
       default:
         // toast, badge, attach, open-url and friends resolve with no payload.
         post(envelope);
@@ -239,7 +280,15 @@ export async function boot(options) {
     return calls.find((entry) => entry.id === id);
   }
 
-  post(readyMessage({ surface, connection, directory, item }));
+  post(
+    readyMessage({
+      surface,
+      connection,
+      directory,
+      item,
+      session: options.session,
+    }),
+  );
   await settle();
 
   return {

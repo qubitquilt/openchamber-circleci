@@ -25,6 +25,7 @@ function runHaystack(run: Run): string {
     shortSha(run.revision),
     run.commitSubject ?? "",
     run.pipelineName ?? "",
+    ...(run.pullRequests ?? []).map((pr) => `#${pr.number}`),
   ]
     .filter(Boolean)
     .join(" ")
@@ -32,19 +33,49 @@ function runHaystack(run: Run): string {
 }
 
 /**
+ * What "this branch" scoping matches: the branch the open directory is on
+ * (see `current-work.ts`) and the pull requests the current session links.
+ * v3 offers no server-side branch filter, so this is applied client-side
+ * over the loaded pages. An empty scope matches everything, which is how a
+ * toggle-off stays a no-op.
+ */
+export interface RunScope {
+  branch: string | null;
+  prNumbers: number[];
+}
+
+export const EMPTY_SCOPE: RunScope = { branch: null, prNumbers: [] };
+
+export function scopeIsEmpty(scope: RunScope): boolean {
+  return !scope.branch && scope.prNumbers.length === 0;
+}
+
+export function runInScope(run: Run, scope: RunScope): boolean {
+  if (scopeIsEmpty(scope)) return true;
+  if (scope.branch && run.branch === scope.branch) return true;
+  const prs = run.pullRequests ?? [];
+  return scope.prNumbers.some((number) => prs.some((pr) => pr.number === number));
+}
+
+export function scopeRuns(runs: Run[], scope: RunScope): Run[] {
+  return runs.filter((run) => runInScope(run, scope));
+}
+
+/**
  * The `running` tab means "may still move", not "phase is literally running":
  * a run on hold or blocked is still a run the user is waiting on, and it is
  * what arms polling. The predicate name says `active` for that reason.
  */
-export function runMatches(run: Run, filter: RunFilter, search = ""): boolean {
+export function runMatches(run: Run, filter: RunFilter, search = "", scope?: RunScope): boolean {
   if (filter === "failed" && !isFailure(run.outcome)) return false;
   if (filter === "running" && !statusOf(run.phase, run.outcome).active) return false;
+  if (scope && !runInScope(run, scope)) return false;
   const needle = search.trim().toLowerCase();
   return needle === "" || runHaystack(run).includes(needle);
 }
 
-export function filterRuns(runs: Run[], filter: RunFilter, search = ""): Run[] {
-  return runs.filter((run) => runMatches(run, filter, search));
+export function filterRuns(runs: Run[], filter: RunFilter, search = "", scope?: RunScope): Run[] {
+  return runs.filter((run) => runMatches(run, filter, search, scope));
 }
 
 interface Activity {

@@ -179,6 +179,12 @@ export function refLabel(run: Run): string {
   return run.branch ?? run.tag ?? "detached";
 }
 
+/** `PR #123` for the first pull request a run carries, or "" when none. */
+export function prMeta(run: Run): string {
+  const pr = run.pullRequests?.[0];
+  return pr ? `PR #${pr.number}` : "";
+}
+
 export function plural(count: number, one: string, many: string = `${one}s`): string {
   return `${count} ${count === 1 ? one : many}`;
 }

@@ -455,6 +455,37 @@ function twoRuns() {
   });
 }
 
+const PR_URL = "https://github.com/acme/web/pull/31";
+
+/** The run fixture with one pull request on its vcs event, as CircleCI reports it. */
+function runWithPr(overrides = {}) {
+  const base = run(overrides);
+  base.references.event.attributes.vcs.pull_requests = [{ number: 31, url: PR_URL }];
+  return base;
+}
+
+/** The run fixture built on a different branch than the open directory's. */
+function onBranch(base, branch) {
+  base.references.event.attributes.vcs.branch = branch;
+  return base;
+}
+
+/** A distinct entity id, so two runs can sit in one list. */
+function asRun(base, id) {
+  base.id = id;
+  return base;
+}
+
+function buttonWith(surface, label) {
+  return [...surface.doc.querySelectorAll("button.oc-sdk-btn")].find(
+    (node) => node.textContent === label,
+  );
+}
+
+function searchInput(surface) {
+  return surface.doc.querySelector("input.oc-sdk-input");
+}
+
 test("a filter tab repaints the list in place, without rebuilding the panel", async () => {
   const surface = await boot({
     html: "panel/index.html",
@@ -559,6 +590,269 @@ test("Escape clears the search the same way the clear button does", async () => 
     await surface.settle();
     assert.equal(input.value, "");
     assert.match(listText(surface), /#12/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the panel's search filters runs, and both clear paths recover", async () => {
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: twoRuns(),
+    files: gitFiles,
+  });
+  try {
+    const input = searchInput(surface);
+    assert.ok(input, "the panel mounts a search field");
+    input.value = "11";
+    input.dispatchEvent(new surface.win.Event("input", { bubbles: true }));
+    await surface.settle();
+    assert.match(listText(surface), /#11/);
+    assert.doesNotMatch(listText(surface), /#12/);
+
+    const clear = surface.doc.querySelector(".oc-sdk-search-clear");
+    assert.ok(clear);
+    clear.click();
+    await surface.settle();
+    assert.equal(input.value, "");
+    assert.match(listText(surface), /#12/);
+
+    input.value = "11";
+    input.dispatchEvent(new surface.win.Event("input", { bubbles: true }));
+    await surface.settle();
+    input.dispatchEvent(new surface.win.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await surface.settle();
+    assert.equal(input.value, "");
+    assert.match(listText(surface), /#12/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("a run announces its pull request and the detail opens it", async () => {
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: routes({
+      "GET /api/v3/runs": () => json(200, { data: [runWithPr()], page: { next: null } }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    assert.match(listText(surface), /PR #31/);
+    const row = [...surface.doc.querySelectorAll(".oc-sdk-list > *")][0] ?? surface.doc;
+    row.click();
+    await surface.settle();
+    const openPR = buttonWith(surface, "Open PR #31");
+    assert.ok(openPR, "the run head offers the PR link CircleCI reported");
+    openPR.click();
+    await surface.settle();
+    assert.ok(
+      surface.calls.some((call) => call.type === "open-url" && call.payload?.url === PR_URL),
+      "the PR link opens through the host",
+    );
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the scope keeps the panel on this branch and auto-opens its newest run", async () => {
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: routes({
+      "GET /api/v3/runs": () =>
+        json(200, {
+          data: [
+            onBranch(run({ number: 12, current_outcome: "failed" }), "feature/side"),
+            run({ number: 11, current_outcome: "succeeded" }),
+          ],
+          page: { next: null },
+        }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    let pill = buttonWith(surface, "This branch");
+    assert.ok(pill, "the scope toggle is mounted because .git/HEAD names a branch");
+    assert.equal(pill.dataset.variant, "outline");
+    pill.click();
+    await surface.settle();
+    // The walk found #11 on main and opened it: the drill-down shows this
+    // run's workflows, never the other branch's run.
+    assert.match(surface.text(), /#11 main/);
+    assert.match(surface.text(), /build-and-test/);
+
+    buttonWith(surface, "← Runs").click();
+    await surface.settle();
+    assert.match(listText(surface), /#11/);
+    assert.doesNotMatch(listText(surface), /#12/);
+    assert.match(surface.doc.querySelector(".scope-note")?.textContent ?? "", /Runs on main/);
+    pill = buttonWith(surface, "This branch");
+    assert.equal(pill.dataset.variant, "default", "the toggle shows it is scoped");
+
+    pill.click();
+    await surface.settle();
+    assert.match(listText(surface), /#12/);
+    assert.doesNotMatch(surface.text(), /Runs on main/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("session pull-request links scope the panel by PR number", async () => {
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: routes({
+      "GET /api/v3/runs": () =>
+        json(200, {
+          data: [
+            onBranch(runWithPr({ number: 12, current_outcome: "failed" }), "other"),
+            onBranch(run({ number: 11, current_outcome: "succeeded" }), "unrelated"),
+          ],
+          page: { next: null },
+        }),
+    }),
+    files: gitFiles,
+    session: { id: "s-1", title: "Session", busy: false },
+    workspace: {
+      projects: [{ id: "op-1", name: "web", directory: "/home/me/web" }],
+      sessions: {
+        "op-1": [{ id: "s-1", links: [{ url: PR_URL, kind: "change" }] }],
+      },
+    },
+  });
+  try {
+    // Both rows before scoping; #12 carries the session's PR on branch "other".
+    assert.match(listText(surface), /#12/);
+    assert.match(listText(surface), /#11/);
+    buttonWith(surface, "This branch").click();
+    await surface.settle();
+    // Scoped: #12 matches by PR number 31; #11 matches by neither branch nor PR.
+    buttonWith(surface, "← Runs").click();
+    await surface.settle();
+    assert.match(listText(surface), /#12/);
+    assert.doesNotMatch(listText(surface), /#11/);
+    assert.match(
+      surface.doc.querySelector(".scope-note")?.textContent ?? "",
+      /Runs on main and PR #31/,
+    );
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the page's scope keeps its runs on this branch and lands on its newest run", async () => {
+  const surface = await boot({
+    html: "panel/page.html",
+    script: "panel/page.js",
+    surface: "page",
+    answers: routes({
+      "GET /api/v3/runs": () =>
+        json(200, {
+          data: [
+            asRun(onBranch(run(), "unrelated"), "run-other"),
+            asRun(run({ number: 11, current_outcome: "succeeded" }), "run-main"),
+          ],
+          page: { next: null },
+        }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    // Unscoped, the page lands on the (failing) first row.
+    assert.match(surface.text(), /#12 unrelated/);
+    buttonWith(surface, "This branch").click();
+    await surface.settle();
+    assert.doesNotMatch(listText(surface), /#12/);
+    assert.match(listText(surface), /#11/);
+    // The detail column moved to the scoped run.
+    assert.match(surface.text(), /#11 main/);
+    assert.match(surface.doc.querySelector(".scope-note")?.textContent ?? "", /Runs on main/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the attach picker's scope keeps its runs on this branch, with its failing first", async () => {
+  const surface = await boot({
+    html: "panel/attach.html",
+    script: "panel/attach.js",
+    surface: "dialog",
+    answers: routes({
+      "GET /api/v3/runs": () =>
+        json(200, {
+          data: [
+            asRun(onBranch(run(), "unrelated"), "run-other"),
+            asRun(onBranch(run({ number: 11, current_outcome: "failed" }), "main"), "run-main"),
+          ],
+          page: { next: null },
+        }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    assert.match(surface.text(), /#12 unrelated/);
+    buttonWith(surface, "This branch").click();
+    await surface.settle();
+    assert.doesNotMatch(listText(surface), /#12/);
+    assert.match(listText(surface), /#11/);
+    // The picker prefers the scoped list's failing run for the preview.
+    assert.match(surface.text(), /#11 main/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("switching the open project re-resolves the panel and clears the filters", async () => {
+  // The index the harness hands handlers is global across calls, so the two
+  // run pages are counted in a closure instead.
+  let served = 0;
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: routes({
+      "GET /api/v3/runs": () => {
+        served += 1;
+        return json(200, {
+          data: [asRun(run({ number: served === 1 ? 12 : 41 }), `run-${served}`)],
+          page: { next: null },
+        });
+      },
+    }),
+    files: gitFiles,
+  });
+  try {
+    assert.match(listText(surface), /#12/);
+    const input = searchInput(surface);
+    input.value = "zzz";
+    input.dispatchEvent(new surface.win.Event("input", { bubbles: true }));
+    await surface.settle();
+    assert.doesNotMatch(listText(surface), /#12/);
+
+    surface.send({
+      channel: "openchamber.sdk",
+      v: 1,
+      type: "directory",
+      payload: { directory: "/elsewhere/tool" },
+    });
+    await surface.settle();
+
+    assert.match(listText(surface), /#41/, "the new project's runs loaded");
+    assert.equal(searchInput(surface)?.value, "", "the search did not survive the switch");
+    assert.equal(
+      surface.requests.filter((entry) => entry.path === "/api/v3/projects").length,
+      2,
+      "the new directory resolved its own project link",
+    );
+    assert.equal(surface.requests.filter((entry) => entry.path === "/api/v3/runs").length, 2);
   } finally {
     surface.dispose();
   }

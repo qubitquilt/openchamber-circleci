@@ -3,12 +3,21 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, promptAbout, startSessionFrom } from "../shared/actions";
 import { readChipData, type ChipSource } from "../shared/chips";
+import { currentWork, scopeOf, type CurrentWork } from "../shared/current-work";
 import { clear, el, metaRow } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
-import { refLabel, relativeTime, shortSha, statusOf, isFailure, duration } from "../shared/format";
+import {
+  prMeta,
+  refLabel,
+  relativeTime,
+  shortSha,
+  statusOf,
+  isFailure,
+  duration,
+} from "../shared/format";
 import { host, notify, readProjectFile, request } from "../shared/host";
 import { createPoller } from "../shared/poll";
-import { anyActive, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
+import { anyActive, filterRuns, parseRunFilter, scopeRuns, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import {
   approveJob as requestApprove,
@@ -28,6 +37,7 @@ import {
   mountEmpty,
   mountList,
   mountMenu,
+  mountSearchField,
   mountTabs,
   openUrl,
   providerNotice,
@@ -84,6 +94,10 @@ interface PanelState {
   runs: Run[];
   runsNext: string | null;
   filter: RunFilter;
+  search: string;
+  /** The branch and PRs this directory's work is on; null hides the scope toggle. */
+  currentWork: CurrentWork | null;
+  scopeOn: boolean;
   selectedRun: Run | null;
   workflows: Workflow[];
   selectedWorkflow: Workflow | null;
@@ -112,6 +126,9 @@ const state: PanelState = {
   runs: [],
   runsNext: null,
   filter: "all",
+  search: "",
+  currentWork: null,
+  scopeOn: false,
   selectedRun: null,
   workflows: [],
   selectedWorkflow: null,
@@ -154,10 +171,9 @@ const picker = createProjectPicker({
     await loadRuns({ more: false });
   },
   onPicked: async (workspace) => {
+    forgetProjectData();
     state.workspace = workspace;
-    state.override = null;
-    state.selectedRun = null;
-    trigger.reset();
+    state.currentWork = await detectCurrentWork();
     render();
     await loadRuns({ more: false });
   },
@@ -179,11 +195,28 @@ const trigger = createTriggerForm({
 
 /* ------------------------------------------------------------------- data */
 
+/**
+ * Branch and PR detection for the open directory. `currentWork` degrades to
+ * null on its own, but a wrapper keeps the same shape as the other boot steps.
+ */
+async function detectCurrentWork(): Promise<CurrentWork | null> {
+  const directory = state.directory;
+  if (!directory) return null;
+  try {
+    return await currentWork({
+      directory,
+      session: state.ready?.session ?? null,
+      readFile: readProjectFile,
+      host,
+    });
+  } catch {
+    return null;
+  }
+}
+
 async function boot(): Promise<void> {
   render();
   state.preferences = await loadPreferences(storage);
-  const directory = state.ready?.directory ?? null;
-  state.directory = directory;
   if (!state.connected) {
     // No token yet: the connect screen is the whole state, and asking CircleCI
     // anything would only produce a 401.
@@ -199,13 +232,25 @@ async function boot(): Promise<void> {
   } catch {
     // The header keeps "CircleCI" when the token cannot read its own user.
   }
-  if (!directory) {
+  await resolveAndLoad();
+}
+
+/**
+ * Resolve the open directory to its project, then load its runs. Boot and a
+ * directory switch arrive with the same question: which project is this, and
+ * what does it build.
+ */
+async function resolveAndLoad(): Promise<void> {
+  const directory = state.directory;
+  const token = ++renderToken;
+  if (!state.connected || !directory) {
     state.loading = false;
     render();
     return;
   }
   try {
     const workspace = await resolveWorkspace(client, storage, directory, readProjectFile);
+    if (token !== renderToken) return;
     state.workspace = workspace;
     if (!workspace) {
       state.loading = false;
@@ -213,8 +258,11 @@ async function boot(): Promise<void> {
       void picker.open();
       return;
     }
+    state.currentWork = await detectCurrentWork();
+    if (token !== renderToken) return;
     await loadRuns();
   } catch (error) {
+    if (token !== renderToken) return;
     state.loading = false;
     state.error = describeError(error);
     if (isDisconnected(error)) state.connected = false;
@@ -222,20 +270,31 @@ async function boot(): Promise<void> {
   }
 }
 
-async function loadRuns(options: { more?: boolean } = {}): Promise<void> {
+async function loadRuns(options: { more?: boolean; openScoped?: boolean } = {}): Promise<void> {
   const workspace = activeWorkspace();
   if (!workspace) return;
   const token = ++renderToken;
+  const scope = state.scopeOn ? scopeOf(state.currentWork) : null;
   if (!options.more) {
     state.loading = true;
     state.error = null;
     render();
   }
   try {
-    const page = await client.listRuns(
-      workspace.link.projectId,
-      options.more ? (state.runsNext ?? undefined) : undefined,
-    );
+    // A scope's reach is whole pages: every fresh scoped load walks until one
+    // run matches, or a refreshed scoped list would drop runs a deeper page
+    // held. Refreshes while scoped cost at most MAX_PAGES GETs; unscoped and
+    // "Load more" stay single-page.
+    const page =
+      scope && !options.more
+        ? await client.listRunsUntil(
+            workspace.link.projectId,
+            (loaded) => scopeRuns(loaded, scope).length > 0,
+          )
+        : await client.listRuns(
+            workspace.link.projectId,
+            options.more ? (state.runsNext ?? undefined) : undefined,
+          );
     if (token !== renderToken) return;
     state.runs = options.more ? [...state.runs, ...page.items] : page.items;
     state.runsNext = page.next;
@@ -249,6 +308,12 @@ async function loadRuns(options: { more?: boolean } = {}): Promise<void> {
   }
   render();
   schedulePoll();
+  if (options.openScoped && scope) {
+    // Runs sort newest first, so the first scoped one is the newest — and the
+    // walk stopped because it exists.
+    const newest = scopeRuns(state.runs, scope)[0];
+    if (newest && !state.selectedRun) await openRun(newest);
+  }
 }
 
 async function loadWorkflows(): Promise<void> {
@@ -400,6 +465,26 @@ function backToJobs(): void {
   state.jobOutput = null;
   render();
   void loadJobs();
+}
+
+/**
+ * The scope toggle is a navigation-level change: on means loading as deep as
+ * it takes to find this branch's runs and opening the newest one, off means
+ * back to the runs list. Both change what the panel shows outright, so this
+ * re-renders instead of repainting rows.
+ */
+async function toggleScope(): Promise<void> {
+  state.scopeOn = !state.scopeOn;
+  if (!state.scopeOn) return backToRuns();
+  state.toast = null;
+  state.selectedRun = null;
+  state.workflows = [];
+  state.selectedWorkflow = null;
+  state.jobs = [];
+  state.selectedJob = null;
+  state.jobDetail = null;
+  state.jobOutput = null;
+  await loadRuns({ openScoped: true });
 }
 
 /* ------------------------------------------------------------------ chips */
@@ -615,7 +700,7 @@ function renderNoProject(): void {
   });
 }
 
-function renderToolbar(): { bar: HTMLElement; tabs: ReturnType<typeof mountTabs> } {
+function renderToolbar(): { tabs: ReturnType<typeof mountTabs> } {
   const workspace = activeWorkspace();
   const head = el("div", { className: "row" });
 
@@ -680,7 +765,56 @@ function renderToolbar(): { bar: HTMLElement; tabs: ReturnType<typeof mountTabs>
   bar.append(refreshHolder);
   root?.append(bar);
 
-  return { bar, tabs };
+  const filterRow = el("div", { className: "filter-row" });
+  const searchHolder = el("div", { style: "flex:1; min-width:0;" });
+  filterRow.append(searchHolder);
+  if (state.currentWork) {
+    const scopeHolder = el("div");
+    scopeHolder.append(scopePill());
+    filterRow.append(scopeHolder);
+  }
+  root?.append(filterRow);
+
+  // The kit never commits a typed or cleared value: it reports the change and
+  // waits for `update({ value })`, so Escape and the clear button need it too.
+  let search: ReturnType<typeof mountSearchField> | null = null;
+  search = mountSearchField(searchHolder, {
+    value: state.search,
+    label: "Filter runs",
+    placeholder: "Filter by branch, commit, PR or number",
+    onChange: (value) => {
+      state.search = value;
+      search?.update({ value });
+      runsView?.paint();
+    },
+  });
+
+  return { tabs };
+}
+
+/**
+ * The scope toggle. The kit's button has no active look, so the variant
+ * carries it: filled while scoped, outline while not.
+ */
+function scopePill(): HTMLElement {
+  const holder = el("div");
+  mountButton(holder, {
+    label: state.currentWork?.branch ? "This branch" : "My pull requests",
+    size: "sm",
+    variant: state.scopeOn ? "default" : "outline",
+    onClick: () => void toggleScope(),
+  });
+  return holder;
+}
+
+/** One muted line naming what the scope keeps, so the toggle is never ambiguous. */
+function scopeNote(): string | null {
+  if (!state.scopeOn || !state.currentWork) return null;
+  const { branch, prNumbers } = state.currentWork;
+  const prs = prNumbers.map((number) => `#${number}`).join(", ");
+  if (branch && prNumbers.length > 0) return `Runs on ${branch} and PR ${prs}`;
+  if (branch) return `Runs on ${branch}`;
+  return prNumbers.length > 0 ? `Runs for PR ${prs}` : null;
 }
 
 /**
@@ -706,8 +840,17 @@ async function requestDisconnect(): Promise<void> {
   render();
 }
 
-/** Forget everything tied to the account, so a later reconnect starts from a clean load. */
-function forgetAccountData(): void {
+/**
+ * Forget everything tied to the current project link: filters, scope,
+ * search and the drill-down. Keeps the connection, the account and the
+ * preferences, so a switched or re-picked project starts from one clean
+ * load of its own runs.
+ */
+function forgetProjectData(): void {
+  state.scopeOn = false;
+  state.search = "";
+  state.filter = "all";
+  state.currentWork = null;
   state.workspace = null;
   state.override = null;
   state.runs = [];
@@ -719,10 +862,17 @@ function forgetAccountData(): void {
   state.selectedJob = null;
   state.jobDetail = null;
   state.jobOutput = null;
+  state.jobsError = null;
   trigger.reset();
   picker.reset();
   state.toast = null;
   state.error = null;
+  updateBadge();
+}
+
+/** Forget everything tied to the account, so a later reconnect starts from a clean load. */
+function forgetAccountData(): void {
+  forgetProjectData();
   state.disconnectNotice = null;
 }
 
@@ -748,7 +898,12 @@ function noticeLine(): void {
 }
 
 function filteredRuns(): Run[] {
-  return filterRuns(state.runs, state.filter);
+  return filterRuns(
+    state.runs,
+    state.filter,
+    state.search,
+    state.scopeOn ? scopeOf(state.currentWork) : undefined,
+  );
 }
 
 function runRows() {
@@ -759,20 +914,31 @@ function runRows() {
       leading: `#${run.number}`,
       title: refLabel(run),
       ...(run.commitSubject ? { subtitle: run.commitSubject } : {}),
-      meta: relativeTime(run.createdAt),
+      meta: [relativeTime(run.createdAt), prMeta(run)].filter(Boolean).join(" · "),
       badge: { label: status.label, tone: status.tone },
     };
   });
 }
 
 function runsEmptyText(): string {
-  return state.runs.length === 0
-    ? "No runs yet. Push a commit, or start one from the project menu."
-    : "No run matches this filter.";
+  if (state.runs.length === 0) {
+    return "No runs yet. Push a commit, or start one from the project menu.";
+  }
+  if (state.scopeOn) {
+    const scope = scopeOf(state.currentWork);
+    const withPrs = Boolean(scope.branch) && scope.prNumbers.length > 0;
+    const what = scope.branch
+      ? `runs on ${scope.branch}${withPrs ? " or its pull requests" : ""}`
+      : "runs for the linked pull requests";
+    return `No ${what} in the loaded pages yet. Load more runs or turn the scope off.`;
+  }
+  return "No run matches this filter.";
 }
 
 function renderRuns(): void {
   const { tabs } = renderToolbar();
+  const note = scopeNote();
+  if (note) root?.append(el("p", { className: "muted scope-note", text: note }));
   noticeLine();
   if (state.loading && state.runs.length === 0) {
     root?.append(spinnerHolder("Loading runs"));
@@ -847,6 +1013,20 @@ function renderRunHead(run: Run): HTMLElement {
     onSelect: (id) => void rerunAll(id === "failed"),
   });
   actions.append(rerunHolder);
+
+  // The PR link is the URL CircleCI itself reports on the run; nothing is
+  // guessed from a bare host name.
+  const pr = run.pullRequests?.[0];
+  if (pr?.url) {
+    const prHolder = el("div");
+    mountButton(prHolder, {
+      label: `Open PR #${pr.number}`,
+      size: "sm",
+      variant: "outline",
+      onClick: () => openUrl(pr.url),
+    });
+    actions.append(prHolder);
+  }
 
   const open = el("div");
   mountButton(open, {
@@ -1236,6 +1416,10 @@ function firstReady(ctx: HostReadyContext): void {
   state.booted = true;
   state.connected = ctx.connection.connected;
   state.account = ctx.connection.account || "CircleCI";
+  // The SDK's onDirectory replays the ready directory right after this
+  // handler returns, so the directory must be recorded synchronously here —
+  // before boot's first await — or the replay would look like a switch.
+  state.directory = ctx.directory;
   void boot();
 }
 
@@ -1258,6 +1442,26 @@ host.onConnection((connection) => {
     forgetAccountData();
     render();
   }
+});
+
+/**
+ * The user switched the open project while the panel was open. A stale list
+ * of another repository is worse than none, so this re-resolves the new
+ * directory exactly like a boot: a fresh link, branch detection and load.
+ */
+async function onDirectoryChanged(directory: string | null): Promise<void> {
+  if (directory === state.directory) return;
+  state.directory = directory;
+  if (state.ready) state.ready = { ...state.ready, directory };
+  forgetProjectData();
+  state.loading = true;
+  render();
+  await resolveAndLoad();
+}
+
+host.onDirectory((directory) => {
+  if (!state.booted) return;
+  void onDirectoryChanged(directory);
 });
 
 /** A chip click lands here with the data it was attached with. */

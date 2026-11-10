@@ -3,12 +3,21 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, startSessionFrom } from "../shared/actions";
 import type { ChipSource } from "../shared/chips";
+import { currentWork, scopeOf, type CurrentWork } from "../shared/current-work";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
-import { duration, isFailure, refLabel, relativeTime, shortSha, statusOf } from "../shared/format";
+import {
+  duration,
+  isFailure,
+  prMeta,
+  refLabel,
+  relativeTime,
+  shortSha,
+  statusOf,
+} from "../shared/format";
 import { host, notify, readProjectFile, request } from "../shared/host";
 import { createPoller } from "../shared/poll";
-import { anyActive, filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
+import { anyActive, filterRuns, parseRunFilter, scopeRuns, type RunFilter } from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import {
   approveJob as requestApprove,
@@ -75,6 +84,9 @@ interface PageState {
   runsNext: string | null;
   filter: RunFilter;
   search: string;
+  /** The branch and PRs this directory's work is on; null hides the scope toggle. */
+  currentWork: CurrentWork | null;
+  scopeOn: boolean;
   selectedRun: Run | null;
   workflows: Workflow[];
   jobs: Record<string, Job[]>;
@@ -96,6 +108,8 @@ const state: PageState = {
   runsNext: null,
   filter: "all",
   search: "",
+  currentWork: null,
+  scopeOn: false,
   selectedRun: null,
   workflows: [],
   jobs: {},
@@ -109,6 +123,22 @@ const state: PageState = {
 let renderToken = 0;
 
 /* ------------------------------------------------------------------- data */
+
+/** Branch and PR detection for the open directory; failures mean no scope toggle. */
+async function detectCurrentWork(): Promise<CurrentWork | null> {
+  const directory = state.directory;
+  if (!directory) return null;
+  try {
+    return await currentWork({
+      directory,
+      session: state.ready?.session ?? null,
+      readFile: readProjectFile,
+      host,
+    });
+  } catch {
+    return null;
+  }
+}
 
 async function boot(): Promise<void> {
   render();
@@ -131,6 +161,7 @@ async function boot(): Promise<void> {
       render();
       return;
     }
+    state.currentWork = await detectCurrentWork();
     await loadRuns();
   } catch (error) {
     state.loading = false;
@@ -144,11 +175,19 @@ async function loadRuns(): Promise<void> {
   const workspace = state.workspace;
   if (!workspace) return;
   const token = ++renderToken;
+  const scope = state.scopeOn ? scopeOf(state.currentWork) : null;
   state.loading = true;
   state.error = null;
   render();
   try {
-    const page = await client.listRuns(workspace.link.projectId);
+    // A scope's reach is whole pages: every scoped load walks until one run
+    // matches, or a refresh would drop runs a deeper page held.
+    const page = scope
+      ? await client.listRunsUntil(
+          workspace.link.projectId,
+          (loaded) => scopeRuns(loaded, scope).length > 0,
+        )
+      : await client.listRuns(workspace.link.projectId);
     if (token !== renderToken) return;
     state.runs = page.items;
     state.runsNext = page.next;
@@ -159,10 +198,14 @@ async function loadRuns(): Promise<void> {
       const refreshed = state.runs.find((run) => run.id === state.selectedRun?.id);
       if (refreshed) state.selectedRun = refreshed;
     }
-    if (!state.selectedRun && page.items[0]) {
-      // The wide layout has room for both columns; land on the newest run.
-      await selectRun(page.items[0]);
-      return;
+    if (!state.selectedRun) {
+      // The wide layout has room for both columns; land on the newest run —
+      // and on the scope's newest first when scoped.
+      const preferred = (scope ? scopeRuns(state.runs, scope)[0] : undefined) ?? page.items[0];
+      if (preferred) {
+        await selectRun(preferred);
+        return;
+      }
     }
   } catch (error) {
     if (token !== renderToken) return;
@@ -214,6 +257,42 @@ async function selectRun(run: Run): Promise<void> {
 async function refreshDetail(): Promise<void> {
   if (state.selectedRun) return selectRun(state.selectedRun);
   return loadRuns();
+}
+
+/**
+ * The scope toggle is a navigation-level change: on loads as deep as it takes
+ * to find this branch's runs (the detail column lands on the newest
+ * automatically), off re-loads the plain first page.
+ */
+async function toggleScope(): Promise<void> {
+  state.scopeOn = !state.scopeOn;
+  state.selectedRun = null;
+  state.workflows = [];
+  state.jobs = {};
+  state.jobErrors = {};
+  await loadRuns();
+}
+
+/** The scope toggle: filled while scoped, outline while not. */
+function scopePill(): HTMLElement {
+  const holder = el("div");
+  mountButton(holder, {
+    label: state.currentWork?.branch ? "This branch" : "My pull requests",
+    size: "sm",
+    variant: state.scopeOn ? "default" : "outline",
+    onClick: () => void toggleScope(),
+  });
+  return holder;
+}
+
+/** One muted line naming what the scope keeps, so the toggle is never ambiguous. */
+function scopeNote(): string | null {
+  if (!state.scopeOn || !state.currentWork) return null;
+  const { branch, prNumbers } = state.currentWork;
+  const prs = prNumbers.map((number) => `#${number}`).join(", ");
+  if (branch && prNumbers.length > 0) return `Runs on ${branch} and PR ${prs}`;
+  if (branch) return `Runs on ${branch}`;
+  return prNumbers.length > 0 ? `Runs for PR ${prs}` : null;
 }
 
 /* ----------------------------------------------------------------- actions */
@@ -393,7 +472,12 @@ function renderToolbar(): void {
 }
 
 function filteredRuns(): Run[] {
-  return filterRuns(state.runs, state.filter, state.search);
+  return filterRuns(
+    state.runs,
+    state.filter,
+    state.search,
+    state.scopeOn ? scopeOf(state.currentWork) : undefined,
+  );
 }
 
 function renderRunColumn(): HTMLElement {
@@ -415,8 +499,18 @@ function renderRunColumn(): HTMLElement {
   });
   column.append(tabsHolder);
 
-  const searchHolder = el("div");
-  column.append(searchHolder);
+  const filterRow = el("div", { className: "filter-row" });
+  const searchHolder = el("div", { style: "flex:1; min-width:0;" });
+  filterRow.append(searchHolder);
+  if (state.currentWork) {
+    const scopeHolder = el("div");
+    scopeHolder.append(scopePill());
+    filterRow.append(scopeHolder);
+  }
+  column.append(filterRow);
+
+  const note = scopeNote();
+  if (note) column.append(el("p", { className: "muted scope-note", text: note }));
 
   const listHolder = el("div", { className: "scroll" });
   column.append(listHolder);
@@ -429,12 +523,22 @@ function renderRunColumn(): HTMLElement {
         leading: `#${run.number}`,
         title: refLabel(run),
         ...(run.commitSubject ? { subtitle: run.commitSubject } : {}),
-        meta: relativeTime(run.createdAt),
+        meta: [relativeTime(run.createdAt), prMeta(run)].filter(Boolean).join(" · "),
         badge: { label: status.label, tone: status.tone },
       };
     });
-  const emptyText = () =>
-    state.runs.length === 0 ? "No runs yet. Push a commit." : "No run matches this filter.";
+  const emptyText = () => {
+    if (state.runs.length === 0) return "No runs yet. Push a commit.";
+    if (state.scopeOn) {
+      const scope = scopeOf(state.currentWork);
+      const withPrs = Boolean(scope.branch) && scope.prNumbers.length > 0;
+      const what = scope.branch
+        ? `runs on ${scope.branch}${withPrs ? " or its pull requests" : ""}`
+        : "runs for the linked pull requests";
+      return `No ${what} in the loaded pages yet. Load more or turn the scope off.`;
+    }
+    return "No run matches this filter.";
+  };
 
   if (state.loading && state.runs.length === 0) {
     listHolder.append(spinnerHolder("Loading runs"));
@@ -525,6 +629,19 @@ function renderDetailColumn(): HTMLElement {
     onClick: () => openUrl(state.workspace ? runUrl(state.workspace.target, run.number) : null),
   });
   actions.append(open);
+  // The PR link is the URL CircleCI itself reports on the run; nothing is
+  // guessed from a bare host name.
+  const pr = run.pullRequests?.[0];
+  if (pr?.url) {
+    const prHolder = el("div");
+    mountButton(prHolder, {
+      label: `Open PR #${pr.number}`,
+      size: "sm",
+      variant: "outline",
+      onClick: () => openUrl(pr.url),
+    });
+    actions.append(prHolder);
+  }
   const attachRun = el("div");
   mountButton(attachRun, {
     label: "Attach run",
