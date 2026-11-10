@@ -3,7 +3,13 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, startSessionFrom } from "../shared/actions";
 import type { ChipSource } from "../shared/chips";
-import { currentWork, scopeOf, type CurrentWork } from "../shared/current-work";
+import {
+  detectCurrentWork,
+  scopeLabel,
+  scopeNote,
+  scopeOf,
+  type CurrentWork,
+} from "../shared/current-work";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { duration, isFailure, prMeta, refLabel, relativeTime, statusOf } from "../shared/format";
@@ -11,6 +17,7 @@ import { host, readProjectFile, request } from "../shared/host";
 import {
   filterRuns,
   parseRunFilter,
+  scopeFound,
   scopeRuns,
   type RunFilter,
   type RunScope,
@@ -108,22 +115,6 @@ const state: PickerState = {
 
 let renderToken = 0;
 
-/** Branch and PR detection for the open directory; failures mean no scope toggle. */
-async function detectCurrentWork(): Promise<CurrentWork | null> {
-  const directory = state.directory;
-  if (!directory) return null;
-  try {
-    return await currentWork({
-      directory,
-      session: state.ready?.session ?? null,
-      readFile: readProjectFile,
-      host,
-    });
-  } catch {
-    return null;
-  }
-}
-
 async function boot(): Promise<void> {
   render();
   state.directory = state.ready?.directory ?? null;
@@ -144,7 +135,12 @@ async function boot(): Promise<void> {
       render();
       return;
     }
-    state.currentWork = await detectCurrentWork();
+    state.currentWork = await detectCurrentWork({
+      directory: state.directory,
+      session: state.ready?.session ?? null,
+      readFile: readProjectFile,
+      host,
+    });
     await loadRuns();
   } catch (error) {
     state.loading = false;
@@ -166,10 +162,7 @@ async function loadRuns(): Promise<void> {
     // A scope's reach is whole pages; the picker loads once, so the walk is
     // the only way a scoped list gets any depth.
     const page = scope
-      ? await client.listRunsUntil(
-          workspace.link.projectId,
-          (loaded) => scopeRuns(loaded, scope).length > 0,
-        )
+      ? await client.listRunsUntil(workspace.link.projectId, scopeFound(scope))
       : await client.listRuns(workspace.link.projectId);
     if (token !== renderToken) return;
     state.runs = page.items;
@@ -300,22 +293,12 @@ function toggleScope(): Promise<void> {
 function scopePill(): HTMLElement {
   const holder = el("div");
   mountButton(holder, {
-    label: state.currentWork?.branch ? "This branch" : "My pull requests",
+    label: scopeLabel(state.currentWork),
     size: "sm",
     variant: state.scopeOn ? "default" : "outline",
     onClick: () => void toggleScope(),
   });
   return holder;
-}
-
-/** One muted line naming what the scope keeps, so the toggle is never ambiguous. */
-function scopeNote(): string | null {
-  if (!state.scopeOn || !state.currentWork) return null;
-  const { branch, prNumbers } = state.currentWork;
-  const prs = prNumbers.map((number) => `#${number}`).join(", ");
-  if (branch && prNumbers.length > 0) return `Runs on ${branch} and PR ${prs}`;
-  if (branch) return `Runs on ${branch}`;
-  return prNumbers.length > 0 ? `Runs for PR ${prs}` : null;
 }
 
 function render(): void {
@@ -399,7 +382,7 @@ function renderRunColumn(): HTMLElement {
   }
   column.append(filterRow);
 
-  const note = scopeNote();
+  const note = state.scopeOn ? scopeNote(state.currentWork) : null;
   if (note) column.append(el("p", { className: "muted scope-note", text: note }));
 
   const listHolder = el("div", { className: "scroll" });

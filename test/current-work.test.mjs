@@ -37,6 +37,8 @@ function hostOf(data) {
 
 const LINKS = [
   { url: "https://github.com/acme/web/pull/31", kind: "change" },
+  // An issue link whose URL looks like a PR: only the kind may exclude it.
+  { url: "https://github.com/acme/web/pull/41", kind: "issue" },
   { url: "https://github.com/acme/web/issues/8", kind: "issue" },
   { url: "https://gitlab.com/acme/web/-/merge_requests/9", kind: "change" },
   { url: "https://bitbucket.org/acme/web/pull-requests/7", kind: "change" },
@@ -102,6 +104,31 @@ test("PR numbers come from this session's links of kind change, in order", async
     }),
   });
   assert.deepEqual(work, { branch: "main", via: "head", prNumbers: [31, 9, 7] });
+});
+
+test("a worktree outside its project's directory still finds its project", async () => {
+  const work = await currentWork({
+    directory: "/worktrees/fix",
+    session: { id: "s-1" },
+    readFile: readFileOf({}),
+    host: hostOf({
+      projects: [
+        { id: "p-1", directory: "/repo" },
+        { id: "p-2", directory: "/other" },
+      ],
+      worktrees: {
+        "p-1": [{ directory: "/repo/.worktrees/a", branch: "a" }],
+        "p-2": [{ directory: "/worktrees/fix", branch: "fix" }],
+      },
+      sessions: {
+        "p-2": [
+          { id: "s-1", links: [{ url: "https://github.com/acme/web/pull/31", kind: "change" }] },
+        ],
+      },
+    }),
+  });
+  // The branch and the PR lookup both come from the discovered project.
+  assert.deepEqual(work, { branch: "fix", via: "worktree", prNumbers: [31] });
 });
 
 test("a link URL is picked apart by provider", () => {

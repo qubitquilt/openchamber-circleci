@@ -50,7 +50,7 @@ export interface WorktreeHost {
 }
 
 export interface CurrentWorkInput {
-  directory: string;
+  directory: string | null;
   /** The open session, from `ready.session`; PR links need it. */
   session: { id: string } | null;
   readFile: ReadProjectFile;
@@ -93,7 +93,24 @@ function worktreeBranch(
   return match?.branch ?? null;
 }
 
+/** The branch `directory` is on in this project's worktree list, or null. */
+async function branchOfProject(
+  input: CurrentWorkInput,
+  projectId: string,
+  directory: string,
+): Promise<string | null> {
+  try {
+    return worktreeBranch((await input.host.listWorktrees(projectId)).worktrees, directory);
+  } catch {
+    // A host without worktree data cannot scope either; the toggle stays hidden.
+    return null;
+  }
+}
+
 export async function currentWork(input: CurrentWorkInput): Promise<CurrentWork | null> {
+  const directory = input.directory;
+  if (!directory) return null;
+
   let branch: string | null = null;
   let via: CurrentWork["via"] = null;
 
@@ -106,24 +123,33 @@ export async function currentWork(input: CurrentWorkInput): Promise<CurrentWork 
     // branch comes from the host's worktree list below.
   }
 
-  let projectId: string | null = null;
+  let projects: Array<{ id: string; directory: string }> | null = null;
   if (input.session || !branch) {
     try {
-      projectId = projectForDirectory((await input.host.listProjects()).projects, input.directory);
+      projects = (await input.host.listProjects()).projects;
     } catch {
       // Without the project list there is no worktree branch and no PR lookup.
     }
   }
 
-  if (projectId && !branch) {
-    try {
-      branch = worktreeBranch(
-        (await input.host.listWorktrees(projectId)).worktrees,
-        input.directory,
-      );
-      if (branch) via = "worktree";
-    } catch {
-      // A host without worktree data cannot scope either; the toggle stays hidden.
+  let projectId = projects ? projectForDirectory(projects, directory) : null;
+
+  if (!branch && projects) {
+    // A worktree can sit outside its project's registered directory — a
+    // sibling, or under a separate worktrees root — where the path no longer
+    // spells out the project. The host still knows the relation, so ask each
+    // project's worktree list, starting with the one the path named.
+    const ordered = projectId
+      ? [projectId, ...projects.filter((project) => project.id !== projectId).map((p) => p.id)]
+      : projects.map((project) => project.id);
+    for (const candidate of ordered) {
+      const found = await branchOfProject(input, candidate, directory);
+      if (found) {
+        projectId = candidate;
+        branch = found;
+        via = "worktree";
+        break;
+      }
     }
   }
 
@@ -145,8 +171,36 @@ export async function currentWork(input: CurrentWorkInput): Promise<CurrentWork 
   return { branch, via, prNumbers };
 }
 
+/**
+ * `currentWork`, with any unexpected failure flattened to "nothing
+ * detected". Surfaces call this one entry point, so the degrade rule lives
+ * here instead of being copied per surface.
+ */
+export async function detectCurrentWork(input: CurrentWorkInput): Promise<CurrentWork | null> {
+  try {
+    return await currentWork(input);
+  } catch {
+    return null;
+  }
+}
+
 /** The scope a detection turns into: everything when nothing was detected. */
 export function scopeOf(work: CurrentWork | null): RunScope {
   if (!work) return EMPTY_SCOPE;
   return { branch: work.branch, prNumbers: work.prNumbers };
+}
+
+/** The scope toggle's own words: which of the two detections it is scoping to. */
+export function scopeLabel(work: CurrentWork | null): string {
+  return work?.branch ? "This branch" : "My pull requests";
+}
+
+/** One muted line naming what the scope keeps, so the toggle is never ambiguous. */
+export function scopeNote(work: CurrentWork | null): string | null {
+  if (!work) return null;
+  const { branch, prNumbers } = work;
+  const prs = prNumbers.map((number) => `#${number}`).join(", ");
+  if (branch && prNumbers.length > 0) return `Runs on ${branch} and PR ${prs}`;
+  if (branch) return `Runs on ${branch}`;
+  return prNumbers.length > 0 ? `Runs for PR ${prs}` : null;
 }

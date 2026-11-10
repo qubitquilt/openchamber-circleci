@@ -665,14 +665,30 @@ test("the scope keeps the panel on this branch and auto-opens its newest run", a
     script: "panel/main.js",
     surface: "panel",
     answers: routes({
-      "GET /api/v3/runs": () =>
-        json(200, {
-          data: [
-            onBranch(run({ number: 12, current_outcome: "failed" }), "feature/side"),
-            run({ number: 11, current_outcome: "succeeded" }),
-          ],
+      "GET /api/v3/runs": (input) => {
+        const cursor = input.query?.["page[cursor]"];
+        if (!cursor) {
+          return json(200, {
+            data: [
+              asRun(
+                onBranch(run({ number: 12, current_outcome: "failed" }), "feature/side"),
+                "run-side",
+              ),
+            ],
+            page: { next: "c1" },
+          });
+        }
+        if (cursor === "c1") {
+          return json(200, {
+            data: [asRun(run({ number: 11, current_outcome: "succeeded" }), "run-on-main")],
+            page: { next: "c2" },
+          });
+        }
+        return json(200, {
+          data: [asRun(run({ number: 10, current_outcome: "succeeded" }), "run-older-main")],
           page: { next: null },
-        }),
+        });
+      },
     }),
     files: gitFiles,
   });
@@ -682,8 +698,8 @@ test("the scope keeps the panel on this branch and auto-opens its newest run", a
     assert.equal(pill.dataset.variant, "outline");
     pill.click();
     await surface.settle();
-    // The walk found #11 on main and opened it: the drill-down shows this
-    // run's workflows, never the other branch's run.
+    // The walk passed the unrelated first page, found #11 on main on page two
+    // and opened it: the drill-down shows this run, never the other branch's.
     assert.match(surface.text(), /#11 main/);
     assert.match(surface.text(), /build-and-test/);
 
@@ -695,10 +711,58 @@ test("the scope keeps the panel on this branch and auto-opens its newest run", a
     pill = buttonWith(surface, "This branch");
     assert.equal(pill.dataset.variant, "default", "the toggle shows it is scoped");
 
-    pill.click();
+    // "Load more" continues from where the walk stopped, and the appended
+    // page is still scoped.
+    buttonWith(surface, "Load more runs").click();
+    await surface.settle();
+    assert.match(listText(surface), /#10/);
+    assert.doesNotMatch(listText(surface), /#12/);
+    const cursors = surface.requests
+      .filter((entry) => entry.path === "/api/v3/runs" && entry.query?.["page[cursor]"])
+      .map((entry) => entry.query["page[cursor]"]);
+    assert.ok(cursors.includes("c1"), "the walk left page one");
+    assert.equal(cursors.at(-1), "c2", "Load more continued from the walked cursor");
+
+    // Repaint replaced the toggle, so re-query before the final click.
+    buttonWith(surface, "This branch").click();
     await surface.settle();
     assert.match(listText(surface), /#12/);
     assert.doesNotMatch(surface.text(), /Runs on main/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("a scoped walk that exhausts its page budget says so instead of opening a run", async () => {
+  let served = 0;
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: routes({
+      "GET /api/v3/runs": () => {
+        served += 1;
+        return json(200, {
+          data: [
+            asRun(
+              onBranch(run({ number: 20 + served, current_outcome: "succeeded" }), "feature/side"),
+              `run-${served}`,
+            ),
+          ],
+          page: { next: `c${served}` },
+        });
+      },
+    }),
+    files: gitFiles,
+  });
+  try {
+    buttonWith(surface, "This branch").click();
+    await surface.settle();
+    assert.match(surface.text(), /No runs on main in the loaded pages yet/);
+    // Boot's first page plus the walk's four-page budget, and no more.
+    assert.equal(surface.requests.filter((entry) => entry.path === "/api/v3/runs").length, 5);
+    // No run was opened: the runs view is still on screen.
+    assert.equal(buttonWith(surface, "← Runs"), undefined);
   } finally {
     surface.dispose();
   }
@@ -754,14 +818,16 @@ test("the page's scope keeps its runs on this branch and lands on its newest run
     script: "panel/page.js",
     surface: "page",
     answers: routes({
-      "GET /api/v3/runs": () =>
-        json(200, {
-          data: [
-            asRun(onBranch(run(), "unrelated"), "run-other"),
-            asRun(run({ number: 11, current_outcome: "succeeded" }), "run-main"),
-          ],
-          page: { next: null },
-        }),
+      "GET /api/v3/runs": (input) =>
+        input.query?.["page[cursor]"]
+          ? json(200, {
+              data: [asRun(run({ number: 11, current_outcome: "succeeded" }), "run-main")],
+              page: { next: null },
+            })
+          : json(200, {
+              data: [asRun(onBranch(run(), "unrelated"), "run-other")],
+              page: { next: "c1" },
+            }),
     }),
     files: gitFiles,
   });
@@ -770,11 +836,39 @@ test("the page's scope keeps its runs on this branch and lands on its newest run
     assert.match(surface.text(), /#12 unrelated/);
     buttonWith(surface, "This branch").click();
     await surface.settle();
+    // The scoped run lived on page two; the walk found it and moved the
+    // detail column there.
     assert.doesNotMatch(listText(surface), /#12/);
     assert.match(listText(surface), /#11/);
-    // The detail column moved to the scoped run.
     assert.match(surface.text(), /#11 main/);
     assert.match(surface.doc.querySelector(".scope-note")?.textContent ?? "", /Runs on main/);
+  } finally {
+    surface.dispose();
+  }
+});
+
+test("the page leaves the detail column empty when the scope has no runs", async () => {
+  const surface = await boot({
+    html: "panel/page.html",
+    script: "panel/page.js",
+    surface: "page",
+    answers: routes({
+      "GET /api/v3/runs": () =>
+        json(200, {
+          data: [asRun(onBranch(run(), "unrelated"), "run-other")],
+          page: { next: null },
+        }),
+    }),
+    files: gitFiles,
+  });
+  try {
+    assert.match(surface.text(), /#12 unrelated/);
+    buttonWith(surface, "This branch").click();
+    await surface.settle();
+    // Scoped to main with nothing on it: no unrelated run may fill the detail.
+    assert.doesNotMatch(surface.text(), /#12 unrelated/);
+    assert.match(surface.text(), /No runs on main in the loaded pages yet/);
+    assert.match(surface.text(), /Pick a run/);
   } finally {
     surface.dispose();
   }
@@ -786,14 +880,18 @@ test("the attach picker's scope keeps its runs on this branch, with its failing 
     script: "panel/attach.js",
     surface: "dialog",
     answers: routes({
-      "GET /api/v3/runs": () =>
-        json(200, {
-          data: [
-            asRun(onBranch(run(), "unrelated"), "run-other"),
-            asRun(onBranch(run({ number: 11, current_outcome: "failed" }), "main"), "run-main"),
-          ],
-          page: { next: null },
-        }),
+      "GET /api/v3/runs": (input) =>
+        input.query?.["page[cursor]"]
+          ? json(200, {
+              data: [
+                asRun(onBranch(run({ number: 11, current_outcome: "failed" }), "main"), "run-main"),
+              ],
+              page: { next: null },
+            })
+          : json(200, {
+              data: [asRun(onBranch(run(), "unrelated"), "run-other")],
+              page: { next: "c1" },
+            }),
     }),
     files: gitFiles,
   });
@@ -803,7 +901,7 @@ test("the attach picker's scope keeps its runs on this branch, with its failing 
     await surface.settle();
     assert.doesNotMatch(listText(surface), /#12/);
     assert.match(listText(surface), /#11/);
-    // The picker prefers the scoped list's failing run for the preview.
+    // The scoped run on page two is the one previewed, failing first.
     assert.match(surface.text(), /#11 main/);
   } finally {
     surface.dispose();

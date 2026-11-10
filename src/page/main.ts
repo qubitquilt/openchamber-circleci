@@ -3,7 +3,13 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, startSessionFrom } from "../shared/actions";
 import type { ChipSource } from "../shared/chips";
-import { currentWork, scopeOf, type CurrentWork } from "../shared/current-work";
+import {
+  detectCurrentWork,
+  scopeLabel,
+  scopeNote,
+  scopeOf,
+  type CurrentWork,
+} from "../shared/current-work";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import {
@@ -17,7 +23,14 @@ import {
 } from "../shared/format";
 import { host, notify, readProjectFile, request } from "../shared/host";
 import { createPoller } from "../shared/poll";
-import { anyActive, filterRuns, parseRunFilter, scopeRuns, type RunFilter } from "../shared/runs";
+import {
+  anyActive,
+  filterRuns,
+  parseRunFilter,
+  scopeFound,
+  scopeRuns,
+  type RunFilter,
+} from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import {
   approveJob as requestApprove,
@@ -124,22 +137,6 @@ let renderToken = 0;
 
 /* ------------------------------------------------------------------- data */
 
-/** Branch and PR detection for the open directory; failures mean no scope toggle. */
-async function detectCurrentWork(): Promise<CurrentWork | null> {
-  const directory = state.directory;
-  if (!directory) return null;
-  try {
-    return await currentWork({
-      directory,
-      session: state.ready?.session ?? null,
-      readFile: readProjectFile,
-      host,
-    });
-  } catch {
-    return null;
-  }
-}
-
 async function boot(): Promise<void> {
   render();
   state.preferences = await loadPreferences(storage);
@@ -161,7 +158,12 @@ async function boot(): Promise<void> {
       render();
       return;
     }
-    state.currentWork = await detectCurrentWork();
+    state.currentWork = await detectCurrentWork({
+      directory: state.directory,
+      session: state.ready?.session ?? null,
+      readFile: readProjectFile,
+      host,
+    });
     await loadRuns();
   } catch (error) {
     state.loading = false;
@@ -183,10 +185,7 @@ async function loadRuns(): Promise<void> {
     // A scope's reach is whole pages: every scoped load walks until one run
     // matches, or a refresh would drop runs a deeper page held.
     const page = scope
-      ? await client.listRunsUntil(
-          workspace.link.projectId,
-          (loaded) => scopeRuns(loaded, scope).length > 0,
-        )
+      ? await client.listRunsUntil(workspace.link.projectId, scopeFound(scope))
       : await client.listRuns(workspace.link.projectId);
     if (token !== renderToken) return;
     state.runs = page.items;
@@ -199,9 +198,10 @@ async function loadRuns(): Promise<void> {
       if (refreshed) state.selectedRun = refreshed;
     }
     if (!state.selectedRun) {
-      // The wide layout has room for both columns; land on the newest run —
-      // and on the scope's newest first when scoped.
-      const preferred = (scope ? scopeRuns(state.runs, scope)[0] : undefined) ?? page.items[0];
+      // The wide layout has room for both columns; land on the newest run.
+      // Scoped, never fall back to an unrelated run: an empty scoped list
+      // leaves the detail column empty next to the scope's own empty message.
+      const preferred = scope ? scopeRuns(state.runs, scope)[0] : page.items[0];
       if (preferred) {
         await selectRun(preferred);
         return;
@@ -277,22 +277,12 @@ async function toggleScope(): Promise<void> {
 function scopePill(): HTMLElement {
   const holder = el("div");
   mountButton(holder, {
-    label: state.currentWork?.branch ? "This branch" : "My pull requests",
+    label: scopeLabel(state.currentWork),
     size: "sm",
     variant: state.scopeOn ? "default" : "outline",
     onClick: () => void toggleScope(),
   });
   return holder;
-}
-
-/** One muted line naming what the scope keeps, so the toggle is never ambiguous. */
-function scopeNote(): string | null {
-  if (!state.scopeOn || !state.currentWork) return null;
-  const { branch, prNumbers } = state.currentWork;
-  const prs = prNumbers.map((number) => `#${number}`).join(", ");
-  if (branch && prNumbers.length > 0) return `Runs on ${branch} and PR ${prs}`;
-  if (branch) return `Runs on ${branch}`;
-  return prNumbers.length > 0 ? `Runs for PR ${prs}` : null;
 }
 
 /* ----------------------------------------------------------------- actions */
@@ -509,7 +499,7 @@ function renderRunColumn(): HTMLElement {
   }
   column.append(filterRow);
 
-  const note = scopeNote();
+  const note = state.scopeOn ? scopeNote(state.currentWork) : null;
   if (note) column.append(el("p", { className: "muted scope-note", text: note }));
 
   const listHolder = el("div", { className: "scroll" });

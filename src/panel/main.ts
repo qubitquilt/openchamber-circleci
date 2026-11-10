@@ -3,7 +3,13 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, promptAbout, startSessionFrom } from "../shared/actions";
 import { readChipData, type ChipSource } from "../shared/chips";
-import { currentWork, scopeOf, type CurrentWork } from "../shared/current-work";
+import {
+  detectCurrentWork,
+  scopeLabel,
+  scopeNote,
+  scopeOf,
+  type CurrentWork,
+} from "../shared/current-work";
 import { clear, el, metaRow } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import {
@@ -17,7 +23,14 @@ import {
 } from "../shared/format";
 import { host, notify, readProjectFile, request } from "../shared/host";
 import { createPoller } from "../shared/poll";
-import { anyActive, filterRuns, parseRunFilter, scopeRuns, type RunFilter } from "../shared/runs";
+import {
+  anyActive,
+  filterRuns,
+  parseRunFilter,
+  scopeFound,
+  scopeRuns,
+  type RunFilter,
+} from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import {
   approveJob as requestApprove,
@@ -173,7 +186,12 @@ const picker = createProjectPicker({
   onPicked: async (workspace) => {
     forgetProjectData();
     state.workspace = workspace;
-    state.currentWork = await detectCurrentWork();
+    state.currentWork = await detectCurrentWork({
+      directory: state.directory,
+      session: state.ready?.session ?? null,
+      readFile: readProjectFile,
+      host,
+    });
     render();
     await loadRuns({ more: false });
   },
@@ -194,25 +212,6 @@ const trigger = createTriggerForm({
 });
 
 /* ------------------------------------------------------------------- data */
-
-/**
- * Branch and PR detection for the open directory. `currentWork` degrades to
- * null on its own, but a wrapper keeps the same shape as the other boot steps.
- */
-async function detectCurrentWork(): Promise<CurrentWork | null> {
-  const directory = state.directory;
-  if (!directory) return null;
-  try {
-    return await currentWork({
-      directory,
-      session: state.ready?.session ?? null,
-      readFile: readProjectFile,
-      host,
-    });
-  } catch {
-    return null;
-  }
-}
 
 async function boot(): Promise<void> {
   render();
@@ -258,8 +257,17 @@ async function resolveAndLoad(): Promise<void> {
       void picker.open();
       return;
     }
-    state.currentWork = await detectCurrentWork();
+    // A detection for the previous directory may resolve after the switch:
+    // only the token-owning load may write the result, or stale branch/PR data
+    // would scope the new directory's runs.
+    const work = await detectCurrentWork({
+      directory: state.directory,
+      session: state.ready?.session ?? null,
+      readFile: readProjectFile,
+      host,
+    });
     if (token !== renderToken) return;
+    state.currentWork = work;
     await loadRuns();
   } catch (error) {
     if (token !== renderToken) return;
@@ -287,10 +295,7 @@ async function loadRuns(options: { more?: boolean; openScoped?: boolean } = {}):
     // "Load more" stay single-page.
     const page =
       scope && !options.more
-        ? await client.listRunsUntil(
-            workspace.link.projectId,
-            (loaded) => scopeRuns(loaded, scope).length > 0,
-          )
+        ? await client.listRunsUntil(workspace.link.projectId, scopeFound(scope))
         : await client.listRuns(
             workspace.link.projectId,
             options.more ? (state.runsNext ?? undefined) : undefined,
@@ -799,22 +804,12 @@ function renderToolbar(): { tabs: ReturnType<typeof mountTabs> } {
 function scopePill(): HTMLElement {
   const holder = el("div");
   mountButton(holder, {
-    label: state.currentWork?.branch ? "This branch" : "My pull requests",
+    label: scopeLabel(state.currentWork),
     size: "sm",
     variant: state.scopeOn ? "default" : "outline",
     onClick: () => void toggleScope(),
   });
   return holder;
-}
-
-/** One muted line naming what the scope keeps, so the toggle is never ambiguous. */
-function scopeNote(): string | null {
-  if (!state.scopeOn || !state.currentWork) return null;
-  const { branch, prNumbers } = state.currentWork;
-  const prs = prNumbers.map((number) => `#${number}`).join(", ");
-  if (branch && prNumbers.length > 0) return `Runs on ${branch} and PR ${prs}`;
-  if (branch) return `Runs on ${branch}`;
-  return prNumbers.length > 0 ? `Runs for PR ${prs}` : null;
 }
 
 /**
@@ -937,7 +932,7 @@ function runsEmptyText(): string {
 
 function renderRuns(): void {
   const { tabs } = renderToolbar();
-  const note = scopeNote();
+  const note = state.scopeOn ? scopeNote(state.currentWork) : null;
   if (note) root?.append(el("p", { className: "muted scope-note", text: note }));
   noticeLine();
   if (state.loading && state.runs.length === 0) {

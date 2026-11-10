@@ -90,7 +90,9 @@ test("a run keeps the pull requests its event reports, dropping malformed ones",
 
 test("a run with no vcs block reads, with no pull requests", async () => {
   const item = runItem();
-  delete item.references.event;
+  // The event stays; only its vcs block is absent, which is the shape the
+  // run parser must tolerate without dropping the run.
+  delete item.references.event.attributes.vcs;
   const { fn } = transport({ "GET /api/v3/runs/run-1": () => ok({ data: item }) });
   const client = createCircleCIClient(fn);
   const run = await client.getRun("run-1");

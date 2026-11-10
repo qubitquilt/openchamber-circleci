@@ -95,9 +95,11 @@ The toggle appears only when the branch (or a linked pull request) is actually k
 1. A normal checkout answers in `.git/HEAD`.
 2. A worktree cannot read `.git/HEAD` (its `.git` is a file pointing outside the project), so the panel
    asks the host: `host.listProjects()` finds the project the directory belongs to, and
-   `host.listWorktrees(projectId)` names the branch each worktree is on. That call is covered by the
-   `sessions` capability, which is granted already — no new capability, no file write, no `.git` inside
-   the worktree.
+   `host.listWorktrees(projectId)` names the branch each worktree is on. A worktree can sit outside its
+   project's directory (a sibling, or under a separate worktrees root), where the path no longer names
+   the project; the extension then asks each project's worktree list for the directory. Those calls are
+   covered by the `sessions` capability, which is granted already — no new capability, no file write,
+   no `.git` inside the worktree.
 
 The pull requests come from the open session's links of kind `change`: their numbers are matched against
 the `pull_requests` block every v3 run reports in `references.event.attributes.vcs`, so a run is found

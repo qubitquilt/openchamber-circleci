@@ -61,6 +61,11 @@ export function scopeRuns(runs: Run[], scope: RunScope): Run[] {
   return runs.filter((run) => runInScope(run, scope));
 }
 
+/** The stop rule for a scoped page walk: a page that holds at least one match. */
+export function scopeFound(scope: RunScope): (runs: Run[]) => boolean {
+  return (runs) => scopeRuns(runs, scope).length > 0;
+}
+
 /**
  * The `running` tab means "may still move", not "phase is literally running":
  * a run on hold or blocked is still a run the user is waiting on, and it is
