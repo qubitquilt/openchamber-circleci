@@ -231,4 +231,4 @@ call, and every CircleCI request is `host.request` postMessage. `host.request` p
 one approved origin. Strings from CircleCI reach the page only as text — nothing sets `innerHTML` — and
 job output is shown in a `<pre>`.
 
-Report a vulnerability through the repository's issue tracker.
+Report a vulnerability privately as described in [SECURITY.md](SECURITY.md); please do not open a public issue.
