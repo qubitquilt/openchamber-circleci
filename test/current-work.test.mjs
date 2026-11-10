@@ -206,20 +206,54 @@ test("a PR lookup failing keeps the branch-only scope", async () => {
 });
 
 test("an external detached worktree still finds its project's session pull requests", async () => {
-  const work = await currentWork({
-    directory: "/worktrees/detached",
-    session: { id: "s-1" },
-    readFile: readFileOf({}),
-    host: hostOf({
-      projects: [{ id: "p-1", directory: "/repo" }],
-      worktrees: { "p-1": [{ directory: "/worktrees/detached", branch: "" }] },
-      sessions: {
-        "p-1": [
-          { id: "s-1", links: [{ url: "https://github.com/acme/web/pull/31", kind: "change" }] },
-        ],
-      },
+  // A host may spell "detached" as an empty branch or as no branch at all.
+  for (const detached of ["", null]) {
+    const work = await currentWork({
+      directory: "/worktrees/detached",
+      session: { id: "s-1" },
+      readFile: readFileOf({}),
+      host: hostOf({
+        projects: [{ id: "p-1", directory: "/repo" }],
+        worktrees: { "p-1": [{ directory: "/worktrees/detached", branch: detached }] },
+        sessions: {
+          "p-1": [
+            { id: "s-1", links: [{ url: "https://github.com/acme/web/pull/31", kind: "change" }] },
+          ],
+        },
+      }),
+    });
+    // No branch, but the project owns the directory and supplies PR scope.
+    assert.deepEqual(work, { branch: null, branchSource: null, prNumbers: [31] }, String(detached));
+  }
+});
+
+test("a project whose worktree list fails does not hide another project's match", async () => {
+  const host = {
+    listProjects: async () => ({
+      kind: "projects",
+      state: "ready",
+      projects: [
+        { id: "p-1", directory: "/repo" },
+        { id: "p-2", directory: "/other" },
+      ],
     }),
+    listWorktrees: async (projectId) => {
+      if (projectId === "p-1") throw new Error("NOT_GRANTED");
+      return {
+        kind: "worktrees",
+        projectId,
+        state: "ready",
+        worktrees: [{ directory: "/worktrees/fix", branch: "fix" }],
+      };
+    },
+    listSessions: async () => ({ kind: "sessions", state: "ready", sessions: [] }),
+  };
+  const work = await currentWork({
+    directory: "/worktrees/fix",
+    session: null,
+    readFile: readFileOf({}),
+    host,
   });
-  // No branch, but the project owns the directory and supplies PR scope.
-  assert.deepEqual(work, { branch: null, branchSource: null, prNumbers: [31] });
+  // p-1 refuses; p-2 still answers with the owning worktree's branch.
+  assert.deepEqual(work, { branch: "fix", branchSource: "worktree", prNumbers: [] });
 });

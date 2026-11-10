@@ -1,6 +1,6 @@
 {
   "name": "openchamber-circleci",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "description": "OpenChamber extension for CircleCI: rail panel, attach picker, chat chips and a full-screen runs page.",

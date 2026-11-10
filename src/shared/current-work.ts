@@ -39,7 +39,8 @@ export interface CurrentWork {
 export interface WorktreeHost {
   listProjects(): Promise<{ projects: Array<{ id: string; directory: string }> }>;
   listWorktrees(projectId: string): Promise<{
-    worktrees: Array<{ directory: string; branch: string }>;
+    /** `branch` is null (or empty) for a detached worktree. */
+    worktrees: Array<{ directory: string; branch: string | null }>;
   }>;
   listSessions(projectId: string): Promise<{
     sessions: Array<{
@@ -88,6 +89,28 @@ interface ProjectWorktree {
   owns: boolean;
   /** The branch that worktree is on, or null when it is detached. */
   branch: string | null;
+  /** True when the host refused this project's worktree list. */
+  failed: boolean;
+}
+
+/** One worktree list, answering "not owned" and "host failed" differently. */
+async function readWorktree(
+  input: CurrentWorkInput,
+  projectId: string,
+  directory: string,
+): Promise<ProjectWorktree> {
+  try {
+    const worktrees = (await input.host.listWorktrees(projectId)).worktrees;
+    const match = worktrees.find((worktree) => worktree.directory === directory);
+    if (!match) return { owns: false, branch: null, failed: false };
+    return {
+      owns: true,
+      branch: typeof match.branch === "string" && match.branch.length > 0 ? match.branch : null,
+      failed: false,
+    };
+  } catch {
+    return { owns: false, branch: null, failed: true };
+  }
 }
 
 /** The worktree of `directory` inside one project's worktree list. */
@@ -96,15 +119,10 @@ async function worktreeInProject(
   projectId: string,
   directory: string,
 ): Promise<ProjectWorktree> {
-  try {
-    const worktrees = (await input.host.listWorktrees(projectId)).worktrees;
-    const match = worktrees.find((worktree) => worktree.directory === directory);
-    if (!match) return { owns: false, branch: null };
-    return { owns: true, branch: match.branch.length > 0 ? match.branch : null };
-  } catch {
-    // A host without worktree data cannot scope either; the toggle stays hidden.
-    return { owns: false, branch: null };
-  }
+  const first = await readWorktree(input, projectId, directory);
+  // A refused read is not the same as "not owned": retry once for a transient
+  // host failure before letting another project answer.
+  return first.failed ? readWorktree(input, projectId, directory) : first;
 }
 
 /** The detection steps. May reject; `detectCurrentWork` is the surface entry point. */
@@ -146,11 +164,11 @@ async function detect(input: CurrentWorkInput): Promise<CurrentWork | null> {
       ? [projectId, ...projects.filter((project) => project.id !== projectId).map((p) => p.id)]
       : projects.map((project) => project.id);
     for (const candidate of ordered) {
-      const found = await worktreeInProject(input, candidate, directory);
-      if (!found.owns) continue;
+      const worktree = await worktreeInProject(input, candidate, directory);
+      if (worktree.failed || !worktree.owns) continue;
       projectId = candidate;
-      if (found.branch) {
-        branch = found.branch;
+      if (worktree.branch) {
+        branch = worktree.branch;
         branchSource = "worktree";
       }
       break;

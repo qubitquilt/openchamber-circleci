@@ -956,6 +956,69 @@ test("switching the open project re-resolves the panel and clears the filters", 
   }
 });
 
+test("a directory switch drops a runs load still in flight for the old project", async () => {
+  let releaseRuns;
+  const runsGate = new Promise((resolve) => {
+    releaseRuns = resolve;
+  });
+  let releaseProject;
+  const projectGate = new Promise((resolve) => {
+    releaseProject = resolve;
+  });
+  let projectCalls = 0;
+  let runCalls = 0;
+  const surface = await boot({
+    html: "panel/index.html",
+    script: "panel/main.js",
+    surface: "panel",
+    answers: routes({
+      "GET /api/v3/projects": () => {
+        projectCalls += 1;
+        // Boot resolves at once; the switched directory waits so the old runs
+        // response can land while the new resolution is still in flight.
+        return projectCalls === 1
+          ? json(200, { data: [project()], page: { next: null } })
+          : projectGate.then(() => json(200, { data: [project()], page: { next: null } }));
+      },
+      "GET /api/v3/runs": () => {
+        runCalls += 1;
+        if (runCalls === 1) {
+          return runsGate.then(() =>
+            json(200, {
+              data: [asRun(run({ number: 90, current_outcome: "failed" }), "old-run")],
+              page: { next: null },
+            }),
+          );
+        }
+        return json(500, { error: { type: "server", title: "boom" } });
+      },
+    }),
+    files: gitFiles,
+  });
+  try {
+    // Boot is waiting on the old project's runs; switch directories now.
+    surface.send({
+      channel: "openchamber.sdk",
+      v: 1,
+      type: "directory",
+      payload: { directory: "/elsewhere/tool" },
+    });
+    await surface.settle();
+
+    releaseRuns();
+    await surface.settle();
+    releaseProject();
+    await surface.settle();
+
+    // The old repository's runs never reach the new project's state, even
+    // though the new page's own load failed.
+    assert.doesNotMatch(surface.text(), /#90/);
+    assert.match(surface.text(), /boom/);
+  } finally {
+    surface.dispose();
+  }
+});
+
 test("removing a control disposes the popup listeners an open menu holds", async () => {
   const surface = await boot({
     html: "panel/index.html",

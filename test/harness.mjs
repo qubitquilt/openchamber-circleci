@@ -190,11 +190,20 @@ export async function boot(options) {
         const handler =
           answers[key] ?? answers[`${input.method} ${input.path.replace(/\/[^/]+$/, "/:id")}`];
         const result = typeof handler === "function" ? handler(input, requests.length) : handler;
-        if (!result) {
-          post({ ...envelope, ok: false, code: "BAD_PATH", error: `No fake route for ${key}` });
+        const respond = (settled) => {
+          if (!settled) {
+            post({ ...envelope, ok: false, code: "BAD_PATH", error: `No fake route for ${key}` });
+            return;
+          }
+          post({ ...envelope, payload: { status: settled.status, body: settled.body ?? "" } });
+        };
+        // A handler may return a promise, so a test can hold a request open and
+        // interleave a directory switch or a poll tick with it.
+        if (result instanceof Promise) {
+          void result.then(respond);
           return;
         }
-        post({ ...envelope, payload: { status: result.status, body: result.body ?? "" } });
+        respond(result);
         return;
       }
       case "file-read": {

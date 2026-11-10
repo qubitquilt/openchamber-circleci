@@ -190,8 +190,9 @@ const picker = createProjectPicker({
     await loadRuns({ more: false });
   },
   onPicked: async (workspace) => {
-    // A resolution still in flight belongs to the previous choice.
+    // A resolution or load still in flight belongs to the previous choice.
     resolveToken += 1;
+    renderToken += 1;
     forgetProjectData();
     state.workspace = workspace;
     state.currentWork = await detectCurrentWork({
@@ -250,6 +251,10 @@ async function boot(): Promise<void> {
 async function resolveAndLoad(): Promise<void> {
   const directory = state.directory;
   const token = ++resolveToken;
+  // Cancel runs/workflow/job loads still in flight for the previous directory.
+  // This resolution checks its own result against `resolveToken` instead, so a
+  // poll tick cannot cancel it.
+  renderToken += 1;
   if (!state.connected || !directory) {
     state.loading = false;
     render();
