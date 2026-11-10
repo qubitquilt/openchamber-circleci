@@ -228,6 +228,7 @@ test("an external detached worktree still finds its project's session pull reque
 });
 
 test("a project whose worktree list fails does not hide another project's match", async () => {
+  let p1Calls = 0;
   const host = {
     listProjects: async () => ({
       kind: "projects",
@@ -238,7 +239,10 @@ test("a project whose worktree list fails does not hide another project's match"
       ],
     }),
     listWorktrees: async (projectId) => {
-      if (projectId === "p-1") throw new Error("NOT_GRANTED");
+      if (projectId === "p-1") {
+        p1Calls += 1;
+        throw new Error("NOT_GRANTED");
+      }
       return {
         kind: "worktrees",
         projectId,
@@ -254,6 +258,45 @@ test("a project whose worktree list fails does not hide another project's match"
     readFile: readFileOf({}),
     host,
   });
-  // p-1 refuses; p-2 still answers with the owning worktree's branch.
+  // p-1 refuses twice (the retry); p-2 still answers with the owning branch.
   assert.deepEqual(work, { branch: "fix", branchSource: "worktree", prNumbers: [] });
+  assert.equal(p1Calls, 2, "the failed project was retried once, then skipped");
+});
+
+test("a transient worktree-read failure is retried for the same project", async () => {
+  const reads = new Map();
+  const host = {
+    listProjects: async () => ({
+      kind: "projects",
+      state: "ready",
+      projects: [
+        { id: "p-1", directory: "/repo" },
+        { id: "p-2", directory: "/other" },
+      ],
+    }),
+    listWorktrees: async (projectId) => {
+      reads.set(projectId, (reads.get(projectId) ?? 0) + 1);
+      if (projectId === "p-1" && reads.get(projectId) === 1) {
+        throw new Error("transient");
+      }
+      if (projectId === "p-2") throw new Error("must not be asked");
+      return {
+        kind: "worktrees",
+        projectId,
+        state: "ready",
+        worktrees: [{ directory: "/worktrees/fix", branch: "fix" }],
+      };
+    },
+    listSessions: async () => ({ kind: "sessions", state: "ready", sessions: [] }),
+  };
+  const work = await currentWork({
+    directory: "/worktrees/fix",
+    session: null,
+    readFile: readFileOf({}),
+    host,
+  });
+  // The retry recovers p-1's branch, so later projects are never asked.
+  assert.deepEqual(work, { branch: "fix", branchSource: "worktree", prNumbers: [] });
+  assert.equal(reads.get("p-1"), 2);
+  assert.equal(reads.get("p-2"), undefined);
 });

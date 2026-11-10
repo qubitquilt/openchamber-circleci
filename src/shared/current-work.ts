@@ -25,7 +25,10 @@ import type { ReadProjectFile } from "./workspace";
 
 export interface CurrentWork {
   branch: string | null;
-  /** How `branch` was learned: `.git/HEAD` or the host's worktree list. */
+  /**
+   * How `branch` was learned: `.git/HEAD` or the host's worktree list.
+   * Non-null exactly when `branch` is non-null.
+   */
   branchSource: "head" | "worktree" | null;
   /** PR numbers linked to the current session, in link order. */
   prNumbers: number[];
@@ -39,7 +42,10 @@ export interface CurrentWork {
 export interface WorktreeHost {
   listProjects(): Promise<{ projects: Array<{ id: string; directory: string }> }>;
   listWorktrees(projectId: string): Promise<{
-    /** `branch` is null (or empty) for a detached worktree. */
+    /**
+     * A detached worktree reports `branch` as `null`, or as `""` on hosts
+     * that only ever send strings. Both normalize to "no branch".
+     */
     worktrees: Array<{ directory: string; branch: string | null }>;
   }>;
   listSessions(projectId: string): Promise<{
@@ -113,6 +119,13 @@ async function readWorktree(
   }
 }
 
+/** A short pause before retrying one refused host read; most failures clear quickly. */
+const RETRY_DELAY_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((done) => setTimeout(done, ms));
+}
+
 /** The worktree of `directory` inside one project's worktree list. */
 async function worktreeInProject(
   input: CurrentWorkInput,
@@ -120,9 +133,11 @@ async function worktreeInProject(
   directory: string,
 ): Promise<ProjectWorktree> {
   const first = await readWorktree(input, projectId, directory);
-  // A refused read is not the same as "not owned": retry once for a transient
-  // host failure before letting another project answer.
-  return first.failed ? readWorktree(input, projectId, directory) : first;
+  if (!first.failed) return first;
+  // A refused read is not the same as "not owned": retry once, after a pause,
+  // for a transient host failure before letting another project answer.
+  await sleep(RETRY_DELAY_MS);
+  return readWorktree(input, projectId, directory);
 }
 
 /** The detection steps. May reject; `detectCurrentWork` is the surface entry point. */
@@ -165,6 +180,10 @@ async function detect(input: CurrentWorkInput): Promise<CurrentWork | null> {
       : projects.map((project) => project.id);
     for (const candidate of ordered) {
       const worktree = await worktreeInProject(input, candidate, directory);
+      // A project that still refuses after the retry is treated as "not
+      // owned": there is no honest scope to offer, so the toggle stays hidden
+      // rather than guessing. A distinct "unknown" result would have no
+      // consumer today.
       if (worktree.failed || !worktree.owns) continue;
       projectId = candidate;
       if (worktree.branch) {
@@ -210,19 +229,4 @@ export async function detectCurrentWork(input: CurrentWorkInput): Promise<Curren
 export function scopeOf(work: CurrentWork | null): RunScope {
   if (!work) return EMPTY_SCOPE;
   return { branch: work.branch, prNumbers: work.prNumbers };
-}
-
-/** The scope toggle's own words. Callers render it only with a detection. */
-export function scopeLabel(work: CurrentWork): string {
-  return work.branch ? "This branch" : "My pull requests";
-}
-
-/** One muted line naming what the scope keeps, so the toggle is never ambiguous. */
-export function scopeNote(work: CurrentWork | null): string | null {
-  if (!work) return null;
-  const { branch, prNumbers } = work;
-  const prs = prNumbers.map((number) => `#${number}`).join(", ");
-  if (branch && prNumbers.length > 0) return `Runs on ${branch} and PR ${prs}`;
-  if (branch) return `Runs on ${branch}`;
-  return prNumbers.length > 0 ? `Runs for PR ${prs}` : null;
 }

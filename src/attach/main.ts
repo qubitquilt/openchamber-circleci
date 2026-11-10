@@ -3,13 +3,8 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, startSessionFrom } from "../shared/actions";
 import type { ChipSource } from "../shared/chips";
-import {
-  detectCurrentWork,
-  scopeLabel,
-  scopeNote,
-  scopeOf,
-  type CurrentWork,
-} from "../shared/current-work";
+import { detectCurrentWork, scopeOf, type CurrentWork } from "../shared/current-work";
+import { scopeLabel, scopeNote } from "../shared/scope-copy";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import { duration, isFailure, prMeta, refLabel, relativeTime, statusOf } from "../shared/format";

@@ -3,13 +3,8 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, promptAbout, startSessionFrom } from "../shared/actions";
 import { readChipData, type ChipSource } from "../shared/chips";
-import {
-  detectCurrentWork,
-  scopeLabel,
-  scopeNote,
-  scopeOf,
-  type CurrentWork,
-} from "../shared/current-work";
+import { detectCurrentWork, scopeOf, type CurrentWork } from "../shared/current-work";
+import { scopeLabel, scopeNote } from "../shared/scope-copy";
 import { clear, el, metaRow } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
 import {
@@ -403,6 +398,9 @@ async function loadJobDetail(): Promise<void> {
         // A job whose log cannot be read still shows its steps and errors.
       }
     }
+    // The output read is a second await: a directory switch during it owns
+    // the loading state now, so this response must not clear it.
+    if (token !== renderToken) return;
     state.loading = false;
   } catch (error) {
     if (token !== renderToken) return;
