@@ -67,7 +67,7 @@ async function findRun(workspace: Workspace, argument: string): Promise<Run> {
       // reach the user as itself, not as a missing run they should stop
       // looking for.
       if (error instanceof CircleCIError && error.status === 404) {
-        throw new Error(`CircleCI has no run ${trimmed}.`);
+        throw new Error(`CircleCI has no run ${trimmed}.`, { cause: error });
       }
       throw error;
     }
