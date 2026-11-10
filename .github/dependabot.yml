@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: typescript
+        versions:
+          - ">=6.1.0"
     groups:
       npm-development-dependencies:
         dependency-type: development
