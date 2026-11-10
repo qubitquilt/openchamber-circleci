@@ -74,6 +74,76 @@ test("a run is read from the v3 envelope", async () => {
   assert.equal(run.trigger, "webhook");
 });
 
+test("a run keeps the pull requests its event reports, dropping malformed ones", async () => {
+  const item = runItem();
+  item.references.event.attributes.vcs.pull_requests = [
+    { number: 31, url: "https://github.com/acme/web/pull/31" },
+    { number: 0 },
+    { number: "x", url: "https://github.com/acme/web/pull/32" },
+    { url: "https://github.com/acme/web/pull/33" },
+  ];
+  const { fn } = transport({ "GET /api/v3/runs/run-1": () => ok({ data: item }) });
+  const client = createCircleCIClient(fn);
+  const run = await client.getRun("run-1");
+  assert.deepEqual(run.pullRequests, [{ number: 31, url: "https://github.com/acme/web/pull/31" }]);
+});
+
+test("a run with no vcs block reads, with no pull requests", async () => {
+  const item = runItem();
+  // The event stays; only its vcs block is absent, which is the shape the
+  // run parser must tolerate without dropping the run.
+  delete item.references.event.attributes.vcs;
+  const { fn } = transport({ "GET /api/v3/runs/run-1": () => ok({ data: item }) });
+  const client = createCircleCIClient(fn);
+  const run = await client.getRun("run-1");
+  assert.deepEqual(run.pullRequests, []);
+});
+
+test("listRunsUntil stops as soon as a run satisfies the predicate", async () => {
+  const { fn, calls } = transport({
+    "GET /api/v3/runs": () => ok({ data: [runItem()], page: { next: "c1" } }),
+  });
+  const client = createCircleCIClient(fn);
+  const page = await client.listRunsUntil("project-1", (runs) => runs.length >= 1);
+  assert.equal(page.items.length, 1);
+  // A stopped walk still reports where it left off, so "Load more" continues.
+  assert.equal(page.next, "c1");
+  assert.equal(calls.length, 1);
+});
+
+test("listRunsUntil keeps walking while the predicate fails", async () => {
+  const { fn, calls } = transport({
+    "GET /api/v3/runs": (_input, count) => {
+      const item = runItem();
+      item.id = `run-${count}`;
+      // The predicate looks for this branch, met on the third page only.
+      item.references.event.attributes.vcs.branch = count < 3 ? `page-${count}` : "mine";
+      return ok({ data: [item], page: { next: count < 3 ? `c${count}` : "more" } });
+    },
+  });
+  const client = createCircleCIClient(fn);
+  const page = await client.listRunsUntil("project-1", (runs) =>
+    runs.some((run) => run.branch === "mine"),
+  );
+  assert.deepEqual(
+    page.items.map((run) => run.id),
+    ["run-1", "run-2", "run-3"],
+  );
+  assert.equal(page.next, "more");
+  assert.equal(calls.length, 3);
+  assert.equal(calls[1].query["page[cursor]"], "c1");
+  assert.equal(calls[2].query["page[cursor]"], "c2");
+});
+
+test("listRunsUntil honours an explicit page budget", async () => {
+  const { fn, calls } = transport({
+    "GET /api/v3/runs": () => ok({ data: [runItem()], page: { next: "again" } }),
+  });
+  const client = createCircleCIClient(fn);
+  await client.listRunsUntil("project-1", () => false, 2);
+  assert.equal(calls.length, 2);
+});
+
 test("the first run page asks for the documented limit", async () => {
   const { fn, calls } = transport({
     "GET /api/v3/runs": () => ok({ data: [runItem()], page: { next: "cursor-1", prev: null } }),

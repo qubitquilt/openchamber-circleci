@@ -3,11 +3,20 @@ import type { HostReadyContext } from "@openchamber/sdk";
 import { createCircleCIClient } from "../shared/client";
 import { attachChip, startSessionFrom } from "../shared/actions";
 import type { ChipSource } from "../shared/chips";
+import { detectCurrentWork, scopeOf, type CurrentWork } from "../shared/current-work";
+import { scopeLabel, scopeNote } from "../shared/scope-copy";
 import { clear, el } from "../shared/dom";
 import { describeError, isDisconnected } from "../shared/errors";
-import { duration, isFailure, refLabel, relativeTime, statusOf } from "../shared/format";
+import { duration, isFailure, prMeta, refLabel, relativeTime, statusOf } from "../shared/format";
 import { host, readProjectFile, request } from "../shared/host";
-import { filterRuns, parseRunFilter, type RunFilter } from "../shared/runs";
+import {
+  filterRuns,
+  parseRunFilter,
+  scopeFound,
+  scopeRuns,
+  type RunFilter,
+  type RunScope,
+} from "../shared/runs";
 import { installStyles } from "../shared/styles";
 import type { StorageLike } from "../shared/storage";
 import type { Job, Run, Workflow } from "../shared/types";
@@ -62,6 +71,9 @@ interface PickerState {
   runs: Run[];
   filter: RunFilter;
   search: string;
+  /** The branch and PRs this directory's work is on; null hides the scope toggle. */
+  currentWork: CurrentWork | null;
+  scopeOn: boolean;
   selectedRun: Run | null;
   workflows: Workflow[];
   jobs: Record<string, Job[]>;
@@ -83,6 +95,8 @@ const state: PickerState = {
   runs: [],
   filter: "all",
   search: "",
+  currentWork: null,
+  scopeOn: false,
   selectedRun: null,
   workflows: [],
   jobs: {},
@@ -116,6 +130,12 @@ async function boot(): Promise<void> {
       render();
       return;
     }
+    state.currentWork = await detectCurrentWork({
+      directory: state.directory,
+      session: state.ready?.session ?? null,
+      readFile: readProjectFile,
+      host,
+    });
     await loadRuns();
   } catch (error) {
     state.loading = false;
@@ -129,18 +149,24 @@ async function loadRuns(): Promise<void> {
   const workspace = state.workspace;
   if (!workspace) return;
   const token = ++renderToken;
+  const scope = state.scopeOn ? scopeOf(state.currentWork) : null;
   state.loading = true;
   state.error = null;
   render();
   try {
-    const page = await client.listRuns(workspace.link.projectId);
+    // A scope's reach is whole pages; the picker loads once, so the walk is
+    // the only way a scoped list gets any depth.
+    const page = scope
+      ? await client.listRunsUntil(workspace.link.projectId, scopeFound(scope))
+      : await client.listRuns(workspace.link.projectId);
     if (token !== renderToken) return;
     state.runs = page.items;
     state.loading = false;
+    const candidates = scope ? scopeRuns(state.runs, scope) : state.runs;
     const preferred =
-      page.items.find((run) => isFailure(run.outcome)) ??
-      page.items.find((run) => statusOf(run.phase, run.outcome).active) ??
-      page.items[0];
+      candidates.find((run) => isFailure(run.outcome)) ??
+      candidates.find((run) => statusOf(run.phase, run.outcome).active) ??
+      candidates[0];
     if (preferred) await selectRun(preferred);
     else render();
   } catch (error) {
@@ -236,8 +262,38 @@ async function startChat(): Promise<void> {
   }
 }
 
+/** Fall back to the plain list when the scope turns off. */
+function activeScope(): RunScope | undefined {
+  return state.scopeOn ? scopeOf(state.currentWork) : undefined;
+}
+
 function filteredRuns(): Run[] {
-  return filterRuns(state.runs, state.filter, state.search);
+  return filterRuns(state.runs, state.filter, state.search, activeScope());
+}
+
+/**
+ * The scope toggle: filled while scoped, outline while not. Picking keeps its
+ * own preference (newest failing run first) inside the scope.
+ */
+function toggleScope(): Promise<void> {
+  state.scopeOn = !state.scopeOn;
+  state.selectedRun = null;
+  state.workflows = [];
+  state.jobs = {};
+  state.jobErrors = {};
+  state.selectedWorkflowId = null;
+  return loadRuns();
+}
+
+function scopePill(work: CurrentWork): HTMLElement {
+  const holder = el("div");
+  mountButton(holder, {
+    label: scopeLabel(work),
+    size: "sm",
+    variant: state.scopeOn ? "default" : "outline",
+    onClick: () => void toggleScope(),
+  });
+  return holder;
 }
 
 function render(): void {
@@ -311,8 +367,19 @@ function renderRunColumn(): HTMLElement {
   });
   column.append(tabsHolder);
 
-  const searchHolder = el("div");
-  column.append(searchHolder);
+  const filterRow = el("div", { className: "filter-row" });
+  const searchHolder = el("div", { style: "flex:1; min-width:0;" });
+  filterRow.append(searchHolder);
+  if (state.currentWork) {
+    const scopeHolder = el("div");
+    scopeHolder.append(scopePill(state.currentWork));
+    filterRow.append(scopeHolder);
+  }
+  column.append(filterRow);
+
+  const note = state.scopeOn ? scopeNote(state.currentWork) : null;
+  if (note) column.append(el("p", { className: "muted scope-note", text: note }));
+
   const listHolder = el("div", { className: "scroll" });
   column.append(listHolder);
 
@@ -324,12 +391,22 @@ function renderRunColumn(): HTMLElement {
         leading: `#${run.number}`,
         title: refLabel(run),
         ...(run.commitSubject ? { subtitle: run.commitSubject } : {}),
-        meta: relativeTime(run.createdAt),
+        meta: [relativeTime(run.createdAt), prMeta(run)].filter(Boolean).join(" · "),
         badge: { label: status.label, tone: status.tone },
       };
     });
-  const emptyText = () =>
-    state.runs.length === 0 ? "No runs yet. Push a commit first." : "No run matches this filter.";
+  const emptyText = () => {
+    if (state.runs.length === 0) return "No runs yet. Push a commit first.";
+    if (state.scopeOn) {
+      const scope = scopeOf(state.currentWork);
+      const withPrs = Boolean(scope.branch) && scope.prNumbers.length > 0;
+      const what = scope.branch
+        ? `runs on ${scope.branch}${withPrs ? " or its pull requests" : ""}`
+        : "runs for the linked pull requests";
+      return `No ${what} in the loaded pages.`;
+    }
+    return "No run matches this filter.";
+  };
 
   if (state.loading && state.runs.length === 0) {
     listHolder.append(spinnerHolder("Loading runs"));
@@ -383,7 +460,12 @@ function renderPreviewColumn(): HTMLElement {
     el(
       "div",
       { className: "detail-sub" },
-      [run.commitSubject ?? "", run.branch ?? run.tag ?? "", relativeTime(run.createdAt)]
+      [
+        run.commitSubject ?? "",
+        run.branch ?? run.tag ?? "",
+        prMeta(run),
+        relativeTime(run.createdAt),
+      ]
         .filter(Boolean)
         .join(" · "),
     ),

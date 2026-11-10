@@ -29,6 +29,7 @@ import type {
   Project,
   Run,
   RunError,
+  RunPR,
   RunWarning,
   User,
   Workflow,
@@ -138,6 +139,13 @@ export function readRun(value: unknown): Run {
       asString(triggerAttributes.name) ??
       asString(asObject(triggerAttributes.event_source).type) ??
       asString(eventAttributes.type),
+    pullRequests: asArray(vcs.pull_requests)
+      .map((entry) => {
+        const pr = asObject(entry);
+        const number = asNumber(pr.number);
+        return number !== null && number > 0 ? { number, url: asString(pr.url) } : null;
+      })
+      .filter((pr): pr is RunPR => pr !== null),
     errors: readErrors(attributes.errors),
     warnings: readWarnings(attributes.warnings),
   };
@@ -313,6 +321,15 @@ export interface CircleCIClient {
   listProjectsOfOrg(orgId: string): Promise<Page<Project>>;
   listPipelines(projectId: string): Promise<PipelineDefinition[]>;
   listRuns(projectId: string, cursor?: string): Promise<Page<Run>>;
+  /**
+   * Runs that page-walk until `stop` holds, because v3 offers no server-side
+   * branch filter: a scoped list loads as deep as it must to find one.
+   */
+  listRunsUntil(
+    projectId: string,
+    stop: (runs: Run[]) => boolean,
+    maxPages?: number,
+  ): Promise<Page<Run>>;
   listMyRuns(cursor?: string): Promise<Page<Run>>;
   getRun(runId: string): Promise<Run>;
   findRunByNumber(projectId: string, number: number): Promise<Run | null>;
@@ -390,6 +407,8 @@ export function createCircleCIClient(request: RequestFn): CircleCIClient {
     limit: number,
     parse: (value: unknown) => T,
     maxPages: number,
+    /** Stop paginating as soon as the items collected so far satisfy this. */
+    stop?: (items: T[]) => boolean,
   ): Promise<Page<T>> {
     const items: T[] = [];
     let cursor: string | undefined;
@@ -398,6 +417,7 @@ export function createCircleCIClient(request: RequestFn): CircleCIClient {
       const result = await fetchPage(path, scope, limit, parse, cursor);
       items.push(...result.items);
       next = result.next;
+      if (stop?.(items)) break;
       if (!next) break;
       cursor = next;
     }
@@ -463,6 +483,9 @@ export function createCircleCIClient(request: RequestFn): CircleCIClient {
     listRuns: (projectId: string, cursor?: string) =>
       fetchPage("/runs", { "filter[project_id]": projectId }, RUN_PAGE_LIMIT, readRun, cursor),
 
+    listRunsUntil: (projectId: string, stop: (runs: Run[]) => boolean, maxPages = MAX_PAGES) =>
+      walk("/runs", { "filter[project_id]": projectId }, RUN_PAGE_LIMIT, readRun, maxPages, stop),
+
     listMyRuns: (cursor?: string) =>
       fetchPage("/runs", { "filter[user_id]": "me" }, RUN_PAGE_LIMIT, readRun, cursor),
 
@@ -472,21 +495,15 @@ export function createCircleCIClient(request: RequestFn): CircleCIClient {
     },
 
     findRunByNumber: async (projectId: string, number: number) => {
-      let cursor: string | undefined;
-      for (let page = 0; page < MAX_PAGES; page += 1) {
-        const runs = await fetchPage(
-          "/runs",
-          { "filter[project_id]": projectId },
-          RUN_PAGE_LIMIT,
-          readRun,
-          cursor,
-        );
-        const match = runs.items.find((run) => run.number === number);
-        if (match) return match;
-        if (!runs.next) return null;
-        cursor = runs.next;
-      }
-      return null;
+      const page = await walk(
+        "/runs",
+        { "filter[project_id]": projectId },
+        RUN_PAGE_LIMIT,
+        readRun,
+        MAX_PAGES,
+        (runs) => runs.some((run) => run.number === number),
+      );
+      return page.items.find((run) => run.number === number) ?? null;
     },
 
     fireRun: async (input) => {

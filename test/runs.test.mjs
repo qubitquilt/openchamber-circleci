@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { RUN_FILTERS, anyActive, filterRuns, parseRunFilter, runMatches } from "../build/runs.mjs";
+import {
+  EMPTY_SCOPE,
+  RUN_FILTERS,
+  anyActive,
+  filterRuns,
+  parseRunFilter,
+  runInScope,
+  runMatches,
+} from "../build/runs.mjs";
 
 function run(overrides = {}) {
   return {
@@ -17,6 +25,7 @@ function run(overrides = {}) {
     commitUrl: null,
     pipelineName: "main config",
     trigger: "webhook",
+    pullRequests: [],
     errors: [],
     warnings: [],
     ...overrides,
@@ -80,6 +89,43 @@ test("search composes with a filter rather than replacing it", () => {
 test("search is case-insensitive and includes the pipeline name", () => {
   assert.equal(runMatches(run(), "all", "MAIN CONFIG"), true);
   assert.equal(runMatches(run(), "all", "FIX THE LOGIN"), true);
+});
+
+test("search also matches a run's pull request number", () => {
+  const withPR = run({
+    pullRequests: [{ number: 31, url: "https://github.com/acme/web/pull/31" }],
+  });
+  assert.equal(runMatches(withPR, "all", "31"), true);
+  assert.equal(runMatches(run(), "all", "31"), false);
+});
+
+test("the scope keeps runs on the open branch or its pull requests", () => {
+  const onBranch = run({ id: "run-1" });
+  const byPR = run({
+    id: "run-2",
+    branch: "other",
+    pullRequests: [{ number: 31, url: null }],
+  });
+  const stray = run({ id: "run-3", branch: "release/x" });
+
+  assert.equal(runInScope(onBranch, { branch: "main", prNumbers: [] }), true);
+  assert.equal(runInScope(byPR, { branch: "main", prNumbers: [31] }), true);
+  assert.equal(runInScope(stray, { branch: "main", prNumbers: [31] }), false);
+  // An empty scope matches everything, so a toggle-off is a no-op.
+  assert.equal(runInScope(stray, EMPTY_SCOPE), true);
+});
+
+test("the scope composes with the status tabs instead of replacing them", () => {
+  const failedOnBranch = run({ id: "run-1" });
+  const okOnBranch = run({ id: "run-2", outcome: "succeeded" });
+  const failedElsewhere = run({ id: "run-3", branch: "release/x" });
+  assert.deepEqual(
+    filterRuns([failedOnBranch, okOnBranch, failedElsewhere], "failed", "", {
+      branch: "main",
+      prNumbers: [],
+    }).map((entry) => entry.id),
+    ["run-1"],
+  );
 });
 
 test("anyActive is true only while something can still move", () => {

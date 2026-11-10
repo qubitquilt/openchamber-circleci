@@ -74,6 +74,16 @@ html, body {
 
 .toolbar > * { min-width: 0; }
 
+/* Search field plus the current-work scope toggle, under the filter tabs. */
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.filter-row > * { min-width: 0; }
+
 .row {
   display: flex;
   align-items: center;
