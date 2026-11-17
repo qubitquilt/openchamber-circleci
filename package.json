@@ -75,7 +75,7 @@
     }
   },
   "dependencies": {
-    "@openchamber/sdk": "^2.7.0"
+    "@openchamber/sdk": "^2.7.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
